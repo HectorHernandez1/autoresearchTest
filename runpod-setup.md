@@ -50,12 +50,24 @@ apt-get install -y nodejs
 npm install -g @anthropic-ai/claude-code
 ```
 
+## Create a non-root user
+
+RunPod runs as root, but Claude Code refuses `--dangerously-skip-permissions` under root. Create a non-root user:
+
+```bash
+useradd -m -s /bin/bash researcher
+cp -r /root/.claude* /home/researcher/ 2>/dev/null
+chown -R researcher:researcher /home/researcher/
+chown -R researcher:researcher /workspace/autoresearchTest
+```
+
 ## Run the experiment
 
 Use tmux so the experiment survives SSH disconnects:
 
 ```bash
 tmux new -s research
+su - researcher
 cd /workspace/autoresearchTest
 claude --dangerously-skip-permissions
 ```
