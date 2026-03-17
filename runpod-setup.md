@@ -23,7 +23,7 @@ git clone https://github.com/HectorHernandez1/autoresearchTest.git
 cd autoresearchTest
 
 # 3. Install system dependencies (needed by Triton for torch.compile)
-apt-get update && apt-get install -y python3.10-dev
+apt-get update && apt-get install -y python3.10-dev tmux
 
 # 4. Install Python dependencies
 uv sync
@@ -84,7 +84,7 @@ cd /workspace/autoresearchTest
 # Re-link cache if you used the symlink approach
 ln -s /workspace/.cache/autoresearch ~/.cache/autoresearch
 
-apt-get update && apt-get install -y python3.10-dev
+apt-get update && apt-get install -y python3.10-dev tmux
 uv sync
 
 # Reinstall Claude Code
