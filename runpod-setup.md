@@ -52,7 +52,10 @@ npm install -g @anthropic-ai/claude-code
 
 ## Run the experiment
 
+Use tmux so the experiment survives SSH disconnects:
+
 ```bash
+tmux new -s research
 cd /workspace/autoresearchTest
 claude
 ```
@@ -62,6 +65,12 @@ On first launch, Claude Code will give you a URL to open in your browser to auth
 > Have a look at program.md and let's kick off a new experiment!
 
 The agent will run autonomously from there (~12 experiments/hour, 5 min each).
+
+### tmux controls
+
+- **Detach** (leave running in background): `Ctrl+b` then `d`
+- **Reattach** (check on progress): `tmux attach -t research`
+- **Kill session**: `tmux kill-session -t research`
 
 ## Resuming after pod restart
 
