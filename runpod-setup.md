@@ -57,12 +57,14 @@ Use tmux so the experiment survives SSH disconnects:
 ```bash
 tmux new -s research
 cd /workspace/autoresearchTest
-claude
+claude --dangerously-skip-permissions
 ```
+
+The `--dangerously-skip-permissions` flag is required for autonomous operation — without it, Claude Code will prompt for approval on every file edit, git command, and training run.
 
 On first launch, Claude Code will give you a URL to open in your browser to authenticate with your Anthropic subscription. After that, tell it:
 
-> Have a look at program.md and let's kick off a new experiment!
+> Please read program.md carefully and follow it. Our H100 baseline is val_bpb 0.997264 (38.5% MFU, 50.3M params, depth 8). Your goal is to beat it. Run autonomously overnight — do not stop to ask me anything. Good luck!
 
 The agent will run autonomously from there (~12 experiments/hour, 5 min each).
 
