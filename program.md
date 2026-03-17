@@ -39,6 +39,18 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
    Run `uv run train.py > run.log 2>&1` on the unmodified `train.py` to establish a baseline
    val_bpb. Record it in `results.tsv`. This is your reference point for all future experiments.
 
+   Known H100 baseline for reference:
+   ```
+   val_bpb:          0.997264
+   peak_vram_mb:     45060.2
+   mfu_percent:      38.50
+   total_tokens_M:   483.4
+   num_steps:        922
+   num_params_M:     50.3
+   depth:            8
+   ```
+   Your baseline may differ slightly due to environment. The target is to beat **val_bpb 0.997264**.
+
 6. **Confirm and proceed:**
    Once baseline is recorded, begin the experiment loop immediately. Do not wait.
 
