@@ -50,6 +50,13 @@ apt-get install -y nodejs
 npm install -g @anthropic-ai/claude-code
 ```
 
+## Configure git
+
+```bash
+git config --global user.email "researcher@autoresearch.dev"
+git config --global user.name "AutoResearch Agent"
+```
+
 ## Create a non-root user
 
 RunPod runs as root, but Claude Code refuses `--dangerously-skip-permissions` under root. Create a non-root user:
