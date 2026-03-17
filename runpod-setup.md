@@ -22,17 +22,20 @@ cd /workspace
 git clone https://github.com/HectorHernandez1/autoresearchTest.git
 cd autoresearchTest
 
-# 3. Install dependencies
+# 3. Install system dependencies (needed by Triton for torch.compile)
+apt-get update && apt-get install -y python3.10-dev
+
+# 4. Install Python dependencies
 uv sync
 
-# 4. Verify GPU
+# 5. Verify GPU
 nvidia-smi
 
-# 5. Persist data cache across pod restarts (optional but recommended)
+# 6. Persist data cache across pod restarts (optional but recommended)
 mkdir -p /workspace/.cache/autoresearch
 ln -s /workspace/.cache/autoresearch ~/.cache/autoresearch
 
-# 6. Download data + train tokenizer (~2 min)
+# 7. Download data + train tokenizer (~2 min)
 uv run prepare.py
 ```
 
@@ -72,6 +75,7 @@ cd /workspace/autoresearchTest
 # Re-link cache if you used the symlink approach
 ln -s /workspace/.cache/autoresearch ~/.cache/autoresearch
 
+apt-get update && apt-get install -y python3.10-dev
 uv sync
 
 # Reinstall Claude Code
