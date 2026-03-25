@@ -139,7 +139,13 @@ Repeat the following indefinitely. **Never stop on your own.**
    If a run produces no output or an obvious Python error, attempt one fix and re-run.
    If it fails again, revert and move on. Do not spend more than two attempts on a crash.
 
-7. **Reflect briefly before the next experiment.**
+7. **Push progress to remote after every kept experiment:**
+   ```
+   git push -u origin autoresearch/arch-exploration
+   ```
+   This lets the human monitor results remotely. Only push after keeping a change, not after reverts.
+
+8. **Reflect briefly before the next experiment.**
    In one sentence, note what the result implies about the model. Use this to inform your
    next hypothesis. Prefer hypotheses that build on prior results rather than random jumps.
 
