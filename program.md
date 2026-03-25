@@ -16,7 +16,7 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
 
 1. **Create the experiment branch:**
    ```
-   git checkout -b autoresearch/arch-exploration
+   git checkout -b autoresearch/arch-exploration-amd
    ```
 
 2. **Read all in-scope files for full context:**
@@ -141,7 +141,7 @@ Repeat the following indefinitely. **Never stop on your own.**
 
 7. **Push progress to remote after every kept experiment:**
    ```
-   git push -u origin autoresearch/arch-exploration
+   git push -u origin autoresearch/arch-exploration-amd
    ```
    This lets the human monitor results remotely. Only push after keeping a change, not after reverts.
 
