@@ -453,7 +453,7 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
-FFN_MULT = 2            # FFN expansion multiplier (SwiGLU: 3 projections of 2x ≈ 2 projections of 3x)
+FFN_MULT = 3            # FFN expansion multiplier (SwiGLU)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step (1 grad_accum step = minimum overhead)
