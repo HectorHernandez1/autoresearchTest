@@ -457,7 +457,7 @@ FFN_MULT = 3            # FFN expansion multiplier (SwiGLU)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step (1 grad_accum step = minimum overhead)
-EMBEDDING_LR = 1.0      # learning rate for token embeddings (Adam)
+EMBEDDING_LR = 1.2      # learning rate for token embeddings (Adam)
 UNEMBEDDING_LR = 0.004  # learning rate for lm_head (Adam)
 MATRIX_LR = 0.02        # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5         # learning rate for per-layer scalars (Adam)
