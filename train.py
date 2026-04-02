@@ -44,6 +44,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    ffn_mult: int = 4
 
 
 def norm(x):
@@ -115,8 +116,9 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        ffn_dim = config.ffn_mult * config.n_embd
+        self.c_fc = nn.Linear(config.n_embd, ffn_dim, bias=False)
+        self.c_proj = nn.Linear(ffn_dim, config.n_embd, bias=False)
 
     def forward(self, x):
         x = self.c_fc(x)
@@ -452,6 +454,7 @@ class MuonAdamW(torch.optim.Optimizer):
 ASPECT_RATIO = 64       # model_dim = depth * ASPECT_RATIO
 HEAD_DIM = 128          # target head dimension for attention
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context
+FFN_MULT = 3            # FFN expansion multiplier (default was 4)
 
 # Optimization
 TOTAL_BATCH_SIZE = 2**15 # ~32K tokens per optimizer step (1 grad_accum step = minimum overhead)
@@ -516,7 +519,7 @@ def build_model_config(depth):
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
+        window_pattern=WINDOW_PATTERN, ffn_mult=FFN_MULT,
     )
 
 config = build_model_config(DEPTH)
