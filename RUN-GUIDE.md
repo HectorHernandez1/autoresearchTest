@@ -3,44 +3,26 @@
 ## Prerequisites
 
 - ROCm 7.2+ installed and working (`rocm-smi` shows your GPU)
-- On branch `test/amd-r9700`
+- On branch `autoresearch/arch-exploration-amd`
 - uv installed
 
-## Step 1: Install dependencies
+## First-time setup
 
 ```bash
+# Install dependencies (pulls PyTorch 2.9.1 ROCm wheel, ~5GB)
 uv sync
-```
 
-This pulls PyTorch 2.9.1 (ROCm 6.3 wheel) and all other deps.
-
-## Step 2: Prepare data (one-time, ~2 min)
-
-```bash
+# Download data + train tokenizer (one-time, ~2 min)
 uv run prepare.py
-```
 
-Downloads data shards and trains a BPE tokenizer to `~/.cache/autoresearch/`.
-
-## Step 3: (Optional) Generate "before" samples
-
-```bash
+# (Optional) Generate "before" samples from untrained model
 uv run generate.py
 ```
 
-Saves a timestamped `samples_*.txt` file with text from the untrained model. This is your "before" snapshot.
-
-## Step 4: Run overnight with Claude Code
-
-Open a tmux session so it survives if your terminal closes:
+## Start the agent
 
 ```bash
-tmux new -s research
-```
-
-Then start Claude Code:
-
-```bash
+cd ~/repo/autoresearchTest
 claude --dangerously-skip-permissions
 ```
 
@@ -48,22 +30,28 @@ Tell it:
 
 > Read program.md and follow it. Run autonomously overnight — do not stop to ask me anything.
 
-It will:
-1. Create branch `autoresearch/arch-exploration-amd`
-2. Run baseline (~5 min)
-3. Loop experiments: hypothesis → edit train.py → commit → train → keep/revert → repeat
-4. Push after every improvement
-5. ~12 experiments/hour, ~100 overnight
+It will loop experiments: hypothesis → edit train.py → commit → train → keep/revert → repeat. Each experiment takes ~5 minutes.
 
-### tmux controls
+## Resume the agent (after stopping)
 
-- **Detach** (leave running): `Ctrl+b` then `d`
-- **Reattach** (check progress): `tmux attach -t research`
-- **Kill session**: `tmux kill-session -t research`
+Same thing — just start Claude Code again:
 
-## Step 5: Review in the morning
+```bash
+cd ~/repo/autoresearchTest
+claude --dangerously-skip-permissions
+```
 
-Check what happened:
+Tell it:
+
+> Read program.md and follow it. Continue from where the last session left off — check results.tsv and git log for what's been tried. Do not stop to ask me anything.
+
+All improvements are committed to git, so it picks up where it left off.
+
+## Stop the agent
+
+Just Ctrl+C in the terminal. Nothing is lost — all kept experiments are already committed.
+
+## Check progress (while it's running or after)
 
 ```bash
 # See the experiment log
@@ -73,19 +61,25 @@ cat results.tsv
 grep "^val_bpb:" run.log
 
 # See git history of improvements
-git log --oneline autoresearch/arch-exploration-amd
+git log --oneline
 ```
 
-## Step 6: Generate "after" samples
+## Generate "after" samples
+
+After stopping the agent:
 
 ```bash
+# Train once on the final best code (5 min) — saves good checkpoint
+uv run train.py
+
+# Generate text from the trained model
 uv run generate.py
 ```
 
-Compare the new `samples_*.txt` with the "before" file to see the quality difference.
+Compare the new `samples_trained_*.txt` with the earlier `samples_untrained_*.txt`.
 
 ## Troubleshooting
 
-- **OOM**: Reduce `DEVICE_BATCH_SIZE` from 128 to 64 in `train.py`
+- **OOM**: Reduce `DEVICE_BATCH_SIZE` in `train.py` (currently 64 for 32GB VRAM)
 - **BF16 issues**: RDNA 4 BF16 support should work but if you see NaN losses, this may need investigation
 - **torch.compile**: Disabled on ROCm for now. May work with future PyTorch releases.
