@@ -10,23 +10,47 @@ human input once the session has started.
 The metric you are optimizing is **val_bpb** (validation bits per byte). Lower is better.
 This metric is vocabulary-size-independent, so architectural changes are fairly compared.
 
-**This session focuses on training dynamics and implicit regularization** — a research axis
-that is orthogonal to the architecture and hyperparameter tuning that came before. See
-"Research Direction" below for why, and what to explore.
+**This session focuses on structural and optimizer shifts.** Prior sessions closed all the
+tuning slack. The only remaining leverage comes from changing the *shape* of the model or
+the *shape* of optimization. See "Research Direction" below.
+
+---
+
+## Prior Work (context)
+
+Two branches have already been exhaustively explored:
+
+1. **`autoresearch/arch-exploration-amd`** — 231 experiments, 35 kept.
+   Tuned DEPTH, width, window pattern, FFN, init, LRs, betas, WD, softcap, warmdown.
+   **Result: val_bpb 1.711 → 1.170 (31% improvement).** Tail experiments ≤0.0005 bpb delta.
+
+2. **`autoresearch/training-dynamics-amd`** — 25 experiments, 0 kept.
+   Tested EMA, SWA, z-loss, MTP, LayerDrop, label smoothing, dropout, gradient noise,
+   Lookahead, token reweighting, depth supervision, stochastic residual scaling, inverted WD.
+   **Result:** every single dynamics perturbation was net negative. Cross-seed noise floor ≈ 0.005.
+   Finding: in this tight 5-min / DEPTH=5 / MuonAdamW regime, training never plateaus, so
+   weight averaging cannot help. Gradient noise was catastrophic (Muon normalizes).
+
+**Conclusion:** HP tuning is done. Dynamics tricks don't work here. The only remaining
+axes are **structural**. Do not waste experiments on tiny HP nudges or dynamics variants —
+they are all within noise.
 
 ---
 
 ## Setup (do this once at the start)
 
-1. **You are already on the experiment branch:** `autoresearch/training-dynamics-amd`.
+1. **You are already on the experiment branch:** `autoresearch/structural-shifts-amd`.
    Do not create a new branch. Do not switch branches.
 
 2. **Read all in-scope files for full context:**
    - `README.md` — repository overview
    - `prepare.py` — fixed constants, data prep, dataloader, evaluation. **Do not modify.**
    - `train.py` — the only file you are allowed to edit.
-   - Recent commit log (`git log --oneline -30`) — understand what has already been tried on
-     the prior branch. The architecture and base hyperparameters are considered tuned.
+   - Recent commit history of prior branches:
+     ```
+     git log --oneline -50 autoresearch/arch-exploration-amd
+     git log --oneline -50 autoresearch/training-dynamics-amd
+     ```
 
 3. **Verify data exists:**
    Check that `~/.cache/autoresearch/` contains data shards and a tokenizer.
@@ -40,10 +64,9 @@ that is orthogonal to the architecture and hyperparameter tuning that came befor
    Do not commit `results.tsv` — it is gitignored.
 
 5. **Record baseline:**
-   Run `uv run train.py > run.log 2>&1` on the current `train.py` to establish the starting
-   baseline for this session. The expected value is approximately **val_bpb 1.1700**, inherited
-   from the prior architecture-exploration branch. Record this as experiment 0 in `results.tsv`.
-   This is your reference point — every dynamics experiment is measured against it.
+   Run `uv run train.py > run.log 2>&1` on the inherited config to establish this session's
+   baseline. **Expected: val_bpb ~1.170**, inherited from training-dynamics-amd. Record as
+   experiment 0 in `results.tsv`. Every structural experiment is measured against this.
 
 6. **Begin immediately.** Do not wait.
 
@@ -51,147 +74,175 @@ that is orthogonal to the architecture and hyperparameter tuning that came befor
 
 ## Research Direction
 
-The prior branch (`autoresearch/arch-exploration-amd`) exhaustively explored model architecture
-(depth, width, window patterns, FFN, init) and optimizer hyperparameters (LRs, betas, weight
-decay, softcap, warmdown). The last ~20 experiments on that branch produced deltas of
-**≤0.0005 bpb** — a clear signal that the agent has reached a local minimum on that axis.
+**Your job is to make structural moves that shift the optimization landscape.** HP tuning
+and dynamics tricks are exhausted. The only remaining leverage comes from changes that
+replace core components of the model or optimizer. Expect a higher crash rate and more
+aggressive reverts — this is expected and fine.
 
-**Your job is not to keep grinding the same axis.** Your job is to explore a genuinely
-orthogonal axis: **how training dynamics and implicit regularization affect val_bpb within
-the same 5-minute budget.**
+Each of the five priority areas below is a *category* of experiments, not a single
+experiment. Work through them roughly in order, but jump between categories freely if a
+lead looks promising or a direction is clearly dead.
 
-You should generally **not** touch `DEPTH`, `ASPECT_RATIO`, `HEAD_DIM`, `WINDOW_PATTERN`,
-`FFN_MULT`, `WEIGHT_DECAY`, `ADAM_BETAS`, `MATRIX_LR`, `EMBEDDING_LR`, `UNEMBEDDING_LR`,
-`SCALAR_LR`, `softcap`, or other knobs that were already tuned on the prior branch — unless
-a dynamics change *reopens* that axis (e.g. if z-loss stabilizes training enough to allow
-higher LRs, that's a legitimate follow-up experiment).
+### Priority 1: Optimizer swaps
 
-### Priority areas to explore (in rough order of expected leverage)
+Muon+AdamW has been tuned to a fine point. A genuinely different optimizer may find a
+different local minimum. Each swap requires re-tuning `MATRIX_LR` and `EMBEDDING_LR` for
+the new optimizer — this is the **only** HP re-tuning allowed in this session.
 
-1. **EMA / weight averaging for evaluation.**
-   Maintain an exponential moving average of the model parameters during training, and
-   evaluate using the EMA weights instead of the live weights. This is the single highest-
-   expected-value experiment on this list. LAWA/SWA-style averaging routinely yields
-   0.005–0.02 bpb gains "for free" in the late-training regime — exactly where a fixed
-   5-minute budget lives. Start with a simple EMA (decay 0.999), then try averaging only
-   over the warmdown tail, then try multiple EMA decays.
+1. **Full AdamW** — Drop Muon entirely. Use AdamW for *all* 2D matrix params. Sanity
+   baseline for whether Muon is load-bearing in this regime.
+2. **Lion** (signSGD-family) — `update = sign(beta1*m + (1-beta1)*g) * lr`. Completely
+   different update geometry. Smaller memory footprint. Known to favor small batches.
+3. **Sophia-G** — Hessian-free second-order. Replaces AdamW's second moment with a
+   diagonal Hessian estimate. Reported 20–30% wall-clock savings on small pretraining.
+4. **SOAP** — Shampoo in Adam's eigenbasis. Second-order preconditioner with AdamW-like
+   numerical behavior.
+5. **Full Shampoo** — Block-diagonal second-order. Most aggressive, most expensive.
+   Only worth trying if Sophia/SOAP show signs of life.
 
-2. **Z-loss (logit norm regularization).**
-   Add an auxiliary loss term `alpha * logsumexp(logits)**2` (typical alpha ~1e-4). This
-   stabilizes training with logit softcapping and often allows the optimizer to push harder
-   without divergence. Try a sweep of alpha values. If successful, this may reopen the LR
-   frontier and unlock follow-up experiments on `MATRIX_LR` / `EMBEDDING_LR`.
+### Priority 2: Alternative block structures
 
-3. **Multi-token prediction (MTP) auxiliary loss.**
-   In addition to the standard next-token CE loss, add a small auxiliary head (or reuse
-   `lm_head` with an offset) that predicts token `t+2` from position `t`. Weight the aux
-   loss at 0.1–0.3. DeepSeek-V3 and Meta's MTP paper show this improves representation
-   quality per gradient step. Start simple (shared head, offset targets) before adding
-   a dedicated head.
+The current Block is strictly serial: `x + attn(norm(x))` → `x + mlp(norm(x))`. Alternative
+topologies change the gradient geometry and throughput tradeoff.
 
-4. **Stochastic depth / LayerDrop.**
-   During training only, randomly skip transformer blocks with a small per-layer probability
-   (0.05–0.1, increasing with depth). Acts as implicit ensembling and regularization. Free
-   at eval time. Watch for training instability — start with very low drop rates.
+1. **Parallel Transformer Block** (GPT-J / PaLM) —
+   `x + attn(norm1(x)) + mlp(norm2(x))`. Both branches computed from the same input.
+   Faster (enables kernel fusion) and sometimes improves quality at small scale.
+2. **NormFormer** — Extra LayerNorm inside the attention output and inside the MLP.
+   Known to stabilize deep/narrow models.
+3. **ReZero** — Replace layer norms with a learnable scalar gate (init 0). Removes norm
+   overhead; may unlock higher LRs.
+4. **Tied input/output embeddings** — Share weights between `wte` and `lm_head`. Halves
+   embedding params, frees budget for other parts. Common in small models.
+5. **Differential Attention** (MSFT, 2024) — Two softmax attention maps subtracted to
+   cancel attention noise. Reported gains on small-scale LM perplexity.
 
-5. **Token loss reweighting.**
-   Down-weight the cross-entropy contribution of the top-K most frequent tokens (e.g. the
-   top 64 by unigram frequency). This forces gradient signal onto informative tokens within
-   the fixed token budget. Try `weight = 0.5` for top-K, or a sqrt-frequency inverse weighting.
+### Priority 3: Data ordering / curriculum
 
-6. **Weight averaging across warmdown trajectory.**
-   Distinct from EMA: periodically snapshot params during the warmdown phase, then at the
-   end average the last N snapshots and evaluate with that. Cheaper than EMA (no running
-   copy required) and often comparable in effect.
+`prepare.py` is frozen, but *what* you feed the model in what order is controlled by
+`train.py`. Don't touch the eval split.
 
-**Composability note:** Unlike architecture changes, most of these *compose*. After you find
-a winner, try stacking the next experiment on top of it rather than reverting. This is the
-advantage of the dynamics axis — hopefully your results accumulate rather than compete.
+1. **Hard-example mining** — Track per-batch loss; revisit the top-K hardest recent
+   batches with extra weight. Requires a small batch-loss buffer.
+2. **Sequence length curriculum (v2)** — 1024→2048 was tried. Try finer schedules
+   (3-stage: 512→1024→2048) or invert it (long→short).
+3. **Bucketed batching** — Group sequences by effective length or entropy.
+4. **Anti-curriculum** — Hard-to-easy. Works for some regimes.
+
+### Priority 4: Compute reallocation
+
+Reshape how fixed compute (32GB VRAM, 5 min) is spent.
+
+1. **Gradient checkpointing** — Trade activation memory for recomputation. Enables a
+   bigger model (DEPTH=8? wider MLP?) in the same VRAM. Cost: ~25% slower per step. If
+   the model-size win outweighs the step-count loss, this is structural leverage.
+2. **Selective recomputation** — Checkpoint only the MLP, not attention. Usually the
+   best perf/memory tradeoff for small models.
+3. **FP8 weights / activations** — Only if R9700 gfx1201 supports it natively; gate
+   behind a capability check. If yes, halves memory and may speed up matmul.
+4. **Grad accum rebalance** — The current `TOTAL_BATCH_SIZE / DEVICE_BATCH_SIZE` split
+   was chosen for throughput. Explore unusual splits only if a larger model requires a
+   smaller DEVICE_BATCH_SIZE.
+
+### Priority 5: The wild ones
+
+Bigger structural changes. High variance, high expected value on a good day.
+
+1. **Mixture of Experts (MoE)** — Replace the single MLP per block with 4 experts and a
+   top-2 router. Doubles total params but keeps active params roughly constant. Known
+   to improve val loss per active FLOP.
+2. **Mixture of Depths (MoD)** — A router lets each token skip layers. Each token visits
+   K-of-N transformer blocks. Frees compute for hard examples.
+3. **State Space block (Mamba/S4)** — Replace attention with a linear-recurrent block in
+   some layers. SDPA's limitations on ROCm make pure-attention variants hard to beat in
+   throughput; a hybrid may sidestep that.
+4. **Hybrid Attention+SSM** — Keep attention in a few layers, SSM in the rest.
+5. **Early exit / token dropping** — Router terminates easy tokens early and propagates
+   hard tokens deeper. Frees compute for hard examples.
+
+**Composability note:** Wins from different categories may stack. After any kept
+experiment, try building on top of it rather than starting fresh.
 
 ---
 
 ## Experiment Loop
 
-Repeat the following indefinitely. **Never stop on your own.**
+Repeat the following indefinitely. **Never stop on your own** except per the plateau rule below.
 
 ### For each experiment:
 
 1. **Form a hypothesis.**
-   Write one clear sentence describing what you expect to change and why you think it will
-   help. Log this in `results.tsv` before running. Examples:
-   - "Adding an EMA of parameters with decay 0.999 and evaluating with the EMA weights will
-     lower val_bpb by smoothing over late-training oscillations."
-   - "Adding z-loss with alpha=1e-4 will stabilize logit scale and allow a later follow-up
-     experiment to raise MATRIX_LR."
+   One clear sentence. Log in `results.tsv` before running. Examples:
+   - "Replacing the serial Block with a parallel attn+mlp block will lower val_bpb by
+     improving throughput and allowing more steps in the 5-min budget."
+   - "Swapping MuonAdamW for Lion with re-tuned LR will reach a different local minimum
+     because sign-based updates have different curvature behavior."
 
 2. **Make exactly one logical change at a time.**
-   Do not bundle multiple independent changes in a single experiment — it makes results
-   uninterpretable. Each experiment should test one clear hypothesis.
+   Do not bundle.
 
 3. **Commit the change, then run:**
    ```
-   git commit -am "experiment: <short description of what you changed>"
+   git commit -am "experiment: <short description>"
    uv run train.py > run.log 2>&1
    ```
-   Commit *before* running so that reverting on failure is a clean `git reset`.
-   Always redirect output. Do not use `tee` or allow output to flood your context.
 
 4. **Read the results:**
    ```
    grep "^val_bpb:\|^peak_vram_mb:" run.log
    ```
-   If the grep is empty, the run crashed. Read the tail of the log:
-   ```
-   tail -n 50 run.log
-   ```
+   If empty, the run crashed. Read `tail -n 50 run.log`.
 
 5. **Keep or revert:**
-   - If `val_bpb` improved (lower): keep the commit. Amend the message with results, e.g.
-     `git commit --amend -m "EMA decay=0.999 eval: val_bpb 1.1700 -> 1.1612"`
-   - If `val_bpb` is equal or worse: revert cleanly with `git reset --hard HEAD~1`
-   - Record the result in `results.tsv` either way.
+   - If `val_bpb` improved: amend the commit message with the result and keep.
+   - Otherwise: `git reset --hard HEAD~1`.
+   - Record in `results.tsv` either way.
 
 6. **Handle crashes:**
-   If a run produces no output or an obvious Python error, attempt one fix and re-run.
-   If it fails again, revert and move on. Do not spend more than two attempts on a crash.
+   One fix attempt max. If it fails again, revert.
 
-7. **Push progress to remote after every kept experiment:**
+7. **Push after every kept experiment:**
    ```
-   git push -u origin autoresearch/training-dynamics-amd
+   git push -u origin autoresearch/structural-shifts-amd
    ```
-   This lets the human monitor results remotely. Only push after keeping a change, not after reverts.
 
-8. **Reflect briefly before the next experiment.**
-   In one sentence, note what the result implies about the model's training dynamics. Use
-   this to inform your next hypothesis. Prefer hypotheses that build on prior results rather
-   than random jumps.
+8. **Reflect briefly.** What did this tell you structurally? Inform the next hypothesis.
+
+---
+
+## Experimental Discipline
+
+- **Composability first.** Wins from different categories may stack. Build on top.
+- **Expect crashes.** Structural changes touch hot paths; dtype / shape / autograd bugs
+  are common. Two-attempt rule still applies.
+- **Track VRAM.** New architectures may blow the 32GB budget. If a promising experiment
+  OOMs, reduce `DEVICE_BATCH_SIZE` and raise grad accum steps to keep `TOTAL_BATCH_SIZE` fixed.
+- **One change per experiment.** Always.
+- **Cross-seed noise floor ≈ 0.005.** Do not chase improvements smaller than this without
+  multi-seed verification.
+- **Plateau rule.** If 15 consecutive experiments produce no kept change across multiple
+  categories, stop and write a final summary — the structural axis may also be saturated.
 
 ---
 
 ## Constraints
 
 - **Only modify `train.py`.** Never touch `prepare.py`, `pyproject.toml`, or any other file.
-- **Do not change the training time budget.** The 5-minute wall-clock limit is fixed by design.
-- **Do not change the evaluation logic.** The val_bpb metric must remain comparable.
-- **Do not revisit architecture or base HP axes.** `DEPTH`, width, window, FFN, LRs, betas,
-  weight decay, softcap were exhaustively tuned on the prior branch. Only revisit them if a
-  dynamics change creates a legitimate reason to (e.g. z-loss allowing higher LRs).
-- **Do not commit `results.tsv`, `run.log`, or `checkpoint*.pt`.** These are gitignored.
-- **Prefer reversible, composable experiments.** The strength of the dynamics axis is that
-  winners stack. After a successful experiment, build on it rather than resetting.
+- **Do not change the training time budget.** 5 minutes is fixed.
+- **Do not change the evaluation logic.** val_bpb must remain comparable.
+- **Do not revisit HP tuning on the existing optimizer.** LRs, betas, WD, softcap,
+  warmdown, init — these are tuned. You may re-tune `MATRIX_LR`/`EMBEDDING_LR` **only**
+  as part of an optimizer swap.
+- **Do not commit `results.tsv`, `run.log`, or `checkpoint*.pt`.** Gitignored.
 
 ---
 
 ## On Failure and Negative Results
 
-Negative results are valuable. If a hypothesis fails, record *why* it likely failed — this
-prevents wasted repetition and builds a coherent picture of the training dynamics. A session
-with 40 failed experiments and a clear understanding of why is more useful than 10 random
-successes with no explanation.
-
-Special note for this session: if EMA / weight averaging experiments fail to produce any
-improvement, that is itself a surprising and publishable-quality finding, and worth
-documenting carefully — it would contradict strong priors from the pretraining literature.
+Negative results remain valuable. If an entire category (e.g. all optimizer swaps) fails,
+write a one-paragraph finding explaining *why* the category failed structurally — this
+prevents repetition in future sessions and is the real product of autoresearch at this
+stage.
 
 ---
 
@@ -199,7 +250,8 @@ documenting carefully — it would contradict strong priors from the pretraining
 
 Do not stop experimenting unless:
 - The data shards are missing and `prepare.py` has not been run (tell the human and wait)
-- There is an unrecoverable environment error (e.g. GPU OOM that cannot be resolved by
-  reducing batch size)
+- There is an unrecoverable environment error (e.g. OOM that cannot be resolved by reducing
+  DEVICE_BATCH_SIZE)
+- You hit the plateau rule above (15 consecutive failures across multiple categories)
 
-In all other cases, form a new hypothesis and continue. The human will check in the morning.
+In all other cases, form a new hypothesis and continue.
