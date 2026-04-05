@@ -40,6 +40,7 @@ class GPTConfig:
     n_kv_head: int = 6
     n_embd: int = 768
     window_pattern: str = "SSSL"
+    ffn_mult: int = 4
 
 
 def norm(x):
@@ -80,7 +81,7 @@ class CausalSelfAttention(nn.Module):
 
         if ve is not None:
             ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
+            gate = 0.1 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
             v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
@@ -99,14 +100,13 @@ class CausalSelfAttention(nn.Module):
 class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=False)
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=False)
+        ffn_dim = config.ffn_mult * config.n_embd
+        self.w_gate = nn.Linear(config.n_embd, ffn_dim, bias=False)
+        self.w_up = nn.Linear(config.n_embd, ffn_dim, bias=False)
+        self.c_proj = nn.Linear(ffn_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = F.relu(x).square()
-        x = self.c_proj(x)
-        return x
+        return self.c_proj(F.silu(self.w_gate(x)) * self.w_up(x))
 
 
 class Block(nn.Module):
@@ -168,7 +168,7 @@ class GPT(nn.Module):
             x = block(x, ve, cos_sin)
         x = norm(x)
 
-        softcap = 15
+        softcap = 13
         logits = self.lm_head(x)
         logits = logits.float()
         logits = softcap * torch.tanh(logits / softcap)
@@ -247,7 +247,8 @@ def main():
             nn.init.uniform_(block.attn.c_k.weight, -s, s)
             nn.init.uniform_(block.attn.c_v.weight, -s, s)
             nn.init.zeros_(block.attn.c_proj.weight)
-            nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            nn.init.uniform_(block.mlp.w_gate.weight, -s, s)
+            nn.init.uniform_(block.mlp.w_up.weight, -s, s)
             nn.init.zeros_(block.mlp.c_proj.weight)
         with torch.no_grad():
             model.resid_lambdas.fill_(1.0)
