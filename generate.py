@@ -23,8 +23,10 @@ PROMPTS = [
     "The president of the United States announced today",
 ]
 MAX_TOKENS = 200
-TEMPERATURE = 1.0
+TEMPERATURE = 0.9
 TOP_K = 40
+REPETITION_PENALTY = 1.3  # >1 discourages repeating recent tokens
+REPETITION_WINDOW = 64    # only penalize tokens seen in the last N positions
 DEPTH = 8
 ASPECT_RATIO = 64
 HEAD_DIM = 128
@@ -188,7 +190,8 @@ def build_config(depth, tokenizer):
     )
 
 
-def generate(model, tokenizer, prompt, max_tokens, temperature, top_k, device):
+def generate(model, tokenizer, prompt, max_tokens, temperature, top_k, device,
+             repetition_penalty=1.0, repetition_window=64):
     model.eval()
     tokens = tokenizer.encode(prompt)
     x = torch.tensor([tokens], dtype=torch.long, device=device)
@@ -198,6 +201,16 @@ def generate(model, tokenizer, prompt, max_tokens, temperature, top_k, device):
             x_cond = x[:, -model.config.sequence_len:]
             logits = model(x_cond)
             logits = logits[:, -1, :] / temperature
+
+            # Repetition penalty: divide logits of recently-seen tokens by penalty
+            # (positive logits shrink, negative logits grow more negative)
+            if repetition_penalty != 1.0:
+                recent = x[0, -repetition_window:].tolist()
+                for tok in set(recent):
+                    if logits[0, tok] > 0:
+                        logits[0, tok] /= repetition_penalty
+                    else:
+                        logits[0, tok] *= repetition_penalty
 
             if top_k > 0:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -271,7 +284,7 @@ def main():
     lines.append(f"Model: {label}")
     lines.append(f"GPU: {gpu_name} ({backend})")
     lines.append(f"depth: {config.n_layer}, n_embd: {config.n_embd}, params: {sum(p.numel() for p in model.parameters()):,}")
-    lines.append(f"temperature: {TEMPERATURE}, top_k: {TOP_K}, max_tokens: {MAX_TOKENS}")
+    lines.append(f"temperature: {TEMPERATURE}, top_k: {TOP_K}, max_tokens: {MAX_TOKENS}, rep_penalty: {REPETITION_PENALTY}")
     lines.append("=" * 60)
 
     for i, prompt in enumerate(PROMPTS):
@@ -279,7 +292,9 @@ def main():
                         max_tokens=MAX_TOKENS,
                         temperature=TEMPERATURE,
                         top_k=TOP_K,
-                        device=device)
+                        device=device,
+                        repetition_penalty=REPETITION_PENALTY,
+                        repetition_window=REPETITION_WINDOW)
         lines.append(f"\n--- Prompt {i+1}: {prompt!r} ---")
         lines.append(text)
 
