@@ -39,10 +39,8 @@ Start from the defaults in `train.py` and explore systematically. Do not assume 
 
 ## Setup (do this once at the start)
 
-1. **Create the experiment branch:**
-   ```
-   git checkout -b autoresearch/arch-exploration-amd-15min
-   ```
+1. **You are already on the experiment branch:** `autoresearch/structural-shifts-amd`.
+   Do not create a new branch. Do not switch branches.
 
 2. **Read all in-scope files for full context:**
    - `README.md` — repository overview
@@ -163,7 +161,7 @@ Repeat the following indefinitely. **Never stop on your own.**
 
 7. **Push progress to remote after every kept experiment:**
    ```
-   git push -u origin autoresearch/arch-exploration-amd-15min
+   git push -u origin autoresearch/structural-shifts-amd
    ```
 
 8. **Reflect briefly before the next experiment.**
