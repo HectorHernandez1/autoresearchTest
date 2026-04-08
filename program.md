@@ -136,6 +136,9 @@ Repeat the following indefinitely. **Never stop on your own.**
    git commit -am "experiment: <short description of what you changed>"
    uv run train.py > run.log 2>&1
    ```
+   **IMPORTANT:** Training takes ~15 minutes. You MUST set the Bash tool timeout to at
+   least 1200000ms (20 minutes) when running `train.py`, otherwise the command will be
+   killed before training completes. Use `run_in_background` if available.
    Commit *before* running so that reverting on failure is a clean `git reset`.
    Always redirect output. Do not use `tee` or allow output to flood your context.
 
