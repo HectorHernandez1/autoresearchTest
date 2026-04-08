@@ -28,7 +28,7 @@ Two branches have already been exhaustively explored:
    Tested EMA, SWA, z-loss, MTP, LayerDrop, label smoothing, dropout, gradient noise,
    Lookahead, token reweighting, depth supervision, stochastic residual scaling, inverted WD.
    **Result:** every single dynamics perturbation was net negative. Cross-seed noise floor ≈ 0.005.
-   Finding: in this tight 5-min / DEPTH=5 / MuonAdamW regime, training never plateaus, so
+   Finding: in this tight 10-min / DEPTH=5 / MuonAdamW regime, training never plateaus, so
    weight averaging cannot help. Gradient noise was catastrophic (Muon normalizes).
 
 **Conclusion:** HP tuning is done. Dynamics tricks don't work here. The only remaining
@@ -65,8 +65,9 @@ they are all within noise.
 
 5. **Record baseline:**
    Run `uv run train.py > run.log 2>&1` on the inherited config to establish this session's
-   baseline. **Expected: val_bpb ~1.170**, inherited from training-dynamics-amd. Record as
-   experiment 0 in `results.tsv`. Every structural experiment is measured against this.
+   baseline. The prior config was tuned at 5 min (val_bpb ~1.170). With the new 10-min budget,
+   the baseline will be lower — record whatever you get as experiment 0. Every structural
+   experiment is measured against this new 10-min baseline.
 
 6. **Begin immediately.** Do not wait.
 
@@ -131,7 +132,7 @@ topologies change the gradient geometry and throughput tradeoff.
 
 ### Priority 4: Compute reallocation
 
-Reshape how fixed compute (32GB VRAM, 5 min) is spent.
+Reshape how fixed compute (32GB VRAM, 10 min) is spent.
 
 1. **Gradient checkpointing** — Trade activation memory for recomputation. Enables a
    bigger model (DEPTH=8? wider MLP?) in the same VRAM. Cost: ~25% slower per step. If
@@ -174,7 +175,7 @@ Repeat the following indefinitely. **Never stop on your own** except per the pla
 1. **Form a hypothesis.**
    One clear sentence. Log in `results.tsv` before running. Examples:
    - "Replacing the serial Block with a parallel attn+mlp block will lower val_bpb by
-     improving throughput and allowing more steps in the 5-min budget."
+     improving throughput and allowing more steps in the 10-min budget."
    - "Swapping MuonAdamW for Lion with re-tuned LR will reach a different local minimum
      because sign-based updates have different curvature behavior."
 
@@ -228,7 +229,7 @@ Repeat the following indefinitely. **Never stop on your own** except per the pla
 ## Constraints
 
 - **Only modify `train.py`.** Never touch `prepare.py`, `pyproject.toml`, or any other file.
-- **Do not change the training time budget.** 5 minutes is fixed.
+- **Do not change the training time budget.** 10 minutes is fixed.
 - **Do not change the evaluation logic.** val_bpb must remain comparable.
 - **Do not revisit HP tuning on the existing optimizer.** LRs, betas, WD, softcap,
   warmdown, init — these are tuned. You may re-tune `MATRIX_LR`/`EMBEDDING_LR` **only**
