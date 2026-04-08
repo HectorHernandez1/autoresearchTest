@@ -10,47 +10,44 @@ human input once the session has started.
 The metric you are optimizing is **val_bpb** (validation bits per byte). Lower is better.
 This metric is vocabulary-size-independent, so architectural changes are fairly compared.
 
-**This session focuses on structural and optimizer shifts.** Prior sessions closed all the
-tuning slack. The only remaining leverage comes from changing the *shape* of the model or
-the *shape* of optimization. See "Research Direction" below.
+**This is a fresh architecture exploration session at 15 minutes per experiment.** All
+hyperparameters are open for re-tuning. Prior sessions were optimized for a 5-min budget —
+those results do NOT carry over. The optimal depth, width, batch size, and LRs will be
+different at 15 min.
 
 ---
 
-## Prior Work (context)
+## Prior Work (context, do not blindly reuse)
 
-Two branches have already been exhaustively explored:
+Prior sessions at 5-min budget found:
+- DEPTH=5, SwiGLU MLP, FFN_MULT=3, softcap=13, TOTAL_BATCH_SIZE=2^15 was optimal at 5 min
+- Muon is essential — AdamW and Lion were significantly worse
+- Value embeddings matter (~16% of val_bpb improvement)
+- QK-norm is stabilizing
+- **Throughput is king** — any change costing even 10% per-step speed gets punished
 
-1. **`autoresearch/arch-exploration-amd`** — 231 experiments, 35 kept.
-   Tuned DEPTH, width, window pattern, FFN, init, LRs, betas, WD, softcap, warmdown.
-   **Result: val_bpb 1.711 → 1.170 (31% improvement).** Tail experiments ≤0.0005 bpb delta.
+**IMPORTANT:** These were tuned for 5 min. At 15 min you have 3x the steps, so:
+- Deeper models (DEPTH=7-10) may now converge where they couldn't before
+- Larger batch sizes may work (better gradient quality matters more with enough steps)
+- LR schedules need re-tuning for the longer horizon
+- Capacity vs throughput tradeoff shifts toward capacity
 
-2. **`autoresearch/training-dynamics-amd`** — 25 experiments, 0 kept.
-   Tested EMA, SWA, z-loss, MTP, LayerDrop, label smoothing, dropout, gradient noise,
-   Lookahead, token reweighting, depth supervision, stochastic residual scaling, inverted WD.
-   **Result:** every single dynamics perturbation was net negative. Cross-seed noise floor ≈ 0.005.
-   Finding: in this tight 10-min / DEPTH=5 / MuonAdamW regime, training never plateaus, so
-   weight averaging cannot help. Gradient noise was catastrophic (Muon normalizes).
-
-**Conclusion:** HP tuning is done. Dynamics tricks don't work here. The only remaining
-axes are **structural**. Do not waste experiments on tiny HP nudges or dynamics variants —
-they are all within noise.
+Start from the defaults in `train.py` and explore systematically. Do not assume the
+5-min optimum is the 15-min optimum.
 
 ---
 
 ## Setup (do this once at the start)
 
-1. **You are already on the experiment branch:** `autoresearch/structural-shifts-amd`.
-   Do not create a new branch. Do not switch branches.
+1. **Create the experiment branch:**
+   ```
+   git checkout -b autoresearch/arch-exploration-amd-15min
+   ```
 
 2. **Read all in-scope files for full context:**
    - `README.md` — repository overview
    - `prepare.py` — fixed constants, data prep, dataloader, evaluation. **Do not modify.**
    - `train.py` — the only file you are allowed to edit.
-   - Recent commit history of prior branches:
-     ```
-     git log --oneline -50 autoresearch/arch-exploration-amd
-     git log --oneline -50 autoresearch/training-dynamics-amd
-     ```
 
 3. **Verify data exists:**
    Check that `~/.cache/autoresearch/` contains data shards and a tokenizer.
@@ -61,189 +58,135 @@ they are all within noise.
    ```
    experiment_id	hypothesis	val_bpb	peak_vram_mb	notes
    ```
-   Do not commit `results.tsv` — it is gitignored.
+   Do not commit `results.tsv` — leave it untracked by git.
 
 5. **Record baseline:**
-   Run `uv run train.py > run.log 2>&1` on the inherited config to establish this session's
-   baseline. The prior config was tuned at 5 min (val_bpb ~1.170). With the new 10-min budget,
-   the baseline will be lower — record whatever you get as experiment 0. Every structural
-   experiment is measured against this new 10-min baseline.
+   Run `uv run train.py > run.log 2>&1` on the current `train.py` to establish a baseline
+   val_bpb. Record it in `results.tsv`. This is your reference point for all future experiments.
+   The baseline will reflect the inherited 5-min config running for 15 min — expect ~1.05-1.10.
 
-6. **Begin immediately.** Do not wait.
+6. **Confirm and proceed:**
+   Once baseline is recorded, begin the experiment loop immediately. Do not wait.
 
 ---
 
 ## Research Direction
 
-**Your job is to make structural moves that shift the optimization landscape.** HP tuning
-and dynamics tricks are exhausted. The only remaining leverage comes from changes that
-replace core components of the model or optimizer. Expect a higher crash rate and more
-aggressive reverts — this is expected and fine.
+Your focus is **full architecture and hyperparameter exploration at the 15-min budget.**
+Everything is open. The goal is to find the best possible val_bpb for this GPU
+(AMD Radeon AI PRO R9700, 32GB VRAM, ~10% MFU) in 15 minutes of training.
 
-Each of the five priority areas below is a *category* of experiments, not a single
-experiment. Work through them roughly in order, but jump between categories freely if a
-lead looks promising or a direction is clearly dead.
+### Priority areas to explore (in rough order):
 
-### Priority 1: Optimizer swaps
+1. **Model depth vs. width tradeoffs**
+   The current `DEPTH` is 5 (optimized for 5 min). With 3x the budget, deeper models have
+   more time to converge. Try DEPTH 6, 7, 8, 10. Note that many dimensions (hidden size,
+   heads, FFN width) are derived from DEPTH, so changing it has broad downstream effects.
+   Understand these dependencies before experimenting.
 
-Muon+AdamW has been tuned to a fine point. A genuinely different optimizer may find a
-different local minimum. Each swap requires re-tuning `MATRIX_LR` and `EMBEDDING_LR` for
-the new optimizer — this is the **only** HP re-tuning allowed in this session.
+2. **Batch size and gradient accumulation**
+   Current `TOTAL_BATCH_SIZE` is 2^15 (optimized for max steps at 5 min). With 15 min, you
+   can afford larger batches (2^16, 2^17) for better gradient quality while still getting
+   enough steps. Sweep this early — it affects everything downstream.
 
-1. **Full AdamW** — Drop Muon entirely. Use AdamW for *all* 2D matrix params. Sanity
-   baseline for whether Muon is load-bearing in this regime.
-2. **Lion** (signSGD-family) — `update = sign(beta1*m + (1-beta1)*g) * lr`. Completely
-   different update geometry. Smaller memory footprint. Known to favor small batches.
-3. **Sophia-G** — Hessian-free second-order. Replaces AdamW's second moment with a
-   diagonal Hessian estimate. Reported 20–30% wall-clock savings on small pretraining.
-4. **SOAP** — Shampoo in Adam's eigenbasis. Second-order preconditioner with AdamW-like
-   numerical behavior.
-5. **Full Shampoo** — Block-diagonal second-order. Most aggressive, most expensive.
-   Only worth trying if Sophia/SOAP show signs of life.
+3. **Learning rates**
+   All LRs (`MATRIX_LR`, `EMBEDDING_LR`, `UNEMBEDDING_LR`, `SCALAR_LR`) were tuned for
+   5-min DEPTH=5. Re-tune them for whatever depth/width you settle on. The LR scaling
+   `1/sqrt(model_dim/768)` should help, but the base rates may need adjustment.
 
-### Priority 2: Alternative block structures
+4. **Warmdown and schedule**
+   `WARMDOWN_RATIO=0.85` was optimal at 5 min. At 15 min, the model has more time at peak
+   LR, so the optimal warmdown fraction may shift. Also re-examine `FINAL_LR_FRAC`.
 
-The current Block is strictly serial: `x + attn(norm(x))` → `x + mlp(norm(x))`. Alternative
-topologies change the gradient geometry and throughput tradeoff.
+5. **MLP and attention variants**
+   SwiGLU with FFN_MULT=3 was optimal at 5 min. At larger model sizes enabled by the longer
+   budget, FFN_MULT=4 or different activations may win. Also try different `WINDOW_PATTERN`
+   values — though note SDPA on ROCm ignores window_size, so this only affects the window
+   size metadata, not actual computation.
 
-1. **Parallel Transformer Block** (GPT-J / PaLM) —
-   `x + attn(norm1(x)) + mlp(norm2(x))`. Both branches computed from the same input.
-   Faster (enables kernel fusion) and sometimes improves quality at small scale.
-2. **NormFormer** — Extra LayerNorm inside the attention output and inside the MLP.
-   Known to stabilize deep/narrow models.
-3. **ReZero** — Replace layer norms with a learnable scalar gate (init 0). Removes norm
-   overhead; may unlock higher LRs.
-4. **Tied input/output embeddings** — Share weights between `wte` and `lm_head`. Halves
-   embedding params, frees budget for other parts. Common in small models.
-5. **Differential Attention** (MSFT, 2024) — Two softmax attention maps subtracted to
-   cancel attention noise. Reported gains on small-scale LM perplexity.
+6. **Weight decay, softcap, init**
+   These interact with model size and LR. Re-tune after settling on depth/width/LR.
 
-### Priority 3: Data ordering / curriculum
-
-`prepare.py` is frozen, but *what* you feed the model in what order is controlled by
-`train.py`. Don't touch the eval split.
-
-1. **Hard-example mining** — Track per-batch loss; revisit the top-K hardest recent
-   batches with extra weight. Requires a small batch-loss buffer.
-2. **Sequence length curriculum (v2)** — 1024→2048 was tried. Try finer schedules
-   (3-stage: 512→1024→2048) or invert it (long→short).
-3. **Bucketed batching** — Group sequences by effective length or entropy.
-4. **Anti-curriculum** — Hard-to-easy. Works for some regimes.
-
-### Priority 4: Compute reallocation
-
-Reshape how fixed compute (32GB VRAM, 10 min) is spent.
-
-1. **Gradient checkpointing** — Trade activation memory for recomputation. Enables a
-   bigger model (DEPTH=8? wider MLP?) in the same VRAM. Cost: ~25% slower per step. If
-   the model-size win outweighs the step-count loss, this is structural leverage.
-2. **Selective recomputation** — Checkpoint only the MLP, not attention. Usually the
-   best perf/memory tradeoff for small models.
-3. **FP8 weights / activations** — Only if R9700 gfx1201 supports it natively; gate
-   behind a capability check. If yes, halves memory and may speed up matmul.
-4. **Grad accum rebalance** — The current `TOTAL_BATCH_SIZE / DEVICE_BATCH_SIZE` split
-   was chosen for throughput. Explore unusual splits only if a larger model requires a
-   smaller DEVICE_BATCH_SIZE.
-
-### Priority 5: The wild ones
-
-Bigger structural changes. High variance, high expected value on a good day.
-
-1. **Mixture of Experts (MoE)** — Replace the single MLP per block with 4 experts and a
-   top-2 router. Doubles total params but keeps active params roughly constant. Known
-   to improve val loss per active FLOP.
-2. **Mixture of Depths (MoD)** — A router lets each token skip layers. Each token visits
-   K-of-N transformer blocks. Frees compute for hard examples.
-3. **State Space block (Mamba/S4)** — Replace attention with a linear-recurrent block in
-   some layers. SDPA's limitations on ROCm make pure-attention variants hard to beat in
-   throughput; a hybrid may sidestep that.
-4. **Hybrid Attention+SSM** — Keep attention in a few layers, SSM in the rest.
-5. **Early exit / token dropping** — Router terminates easy tokens early and propagates
-   hard tokens deeper. Frees compute for hard examples.
-
-**Composability note:** Wins from different categories may stack. After any kept
-experiment, try building on top of it rather than starting fresh.
+7. **Optimizer balance**
+   Muon is confirmed essential. But the Muon HPs (momentum, ns_steps, beta2) and the
+   AdamW-vs-Muon split may have different optima at the new scale.
 
 ---
 
 ## Experiment Loop
 
-Repeat the following indefinitely. **Never stop on your own** except per the plateau rule below.
+Repeat the following indefinitely. **Never stop on your own.**
 
 ### For each experiment:
 
 1. **Form a hypothesis.**
-   One clear sentence. Log in `results.tsv` before running. Examples:
-   - "Replacing the serial Block with a parallel attn+mlp block will lower val_bpb by
-     improving throughput and allowing more steps in the 10-min budget."
-   - "Swapping MuonAdamW for Lion with re-tuned LR will reach a different local minimum
-     because sign-based updates have different curvature behavior."
+   Write one clear sentence describing what you expect to change and why you think it will
+   help. Log this in `results.tsv` before running. Examples:
+   - "Increasing DEPTH from 5 to 8 will lower val_bpb because the 15-min budget provides
+     enough steps for a larger model to converge."
+   - "Increasing TOTAL_BATCH_SIZE from 2^15 to 2^17 will improve gradient quality enough
+     to offset the reduced step count at 15 min."
 
 2. **Make exactly one logical change at a time.**
-   Do not bundle.
+   Do not bundle multiple independent changes in a single experiment — it makes results
+   uninterpretable. Each experiment should test one clear hypothesis.
 
 3. **Commit the change, then run:**
    ```
-   git commit -am "experiment: <short description>"
+   git commit -am "experiment: <short description of what you changed>"
    uv run train.py > run.log 2>&1
    ```
+   Commit *before* running so that reverting on failure is a clean `git reset`.
+   Always redirect output. Do not use `tee` or allow output to flood your context.
 
 4. **Read the results:**
    ```
    grep "^val_bpb:\|^peak_vram_mb:" run.log
    ```
-   If empty, the run crashed. Read `tail -n 50 run.log`.
+   If the grep is empty, the run crashed. Read the tail of the log:
+   ```
+   tail -n 50 run.log
+   ```
 
 5. **Keep or revert:**
-   - If `val_bpb` improved: amend the commit message with the result and keep.
-   - Otherwise: `git reset --hard HEAD~1`.
-   - Record in `results.tsv` either way.
+   - If `val_bpb` improved (lower): keep the commit. Optionally amend with results:
+     `git commit --amend -m "depth=8: val_bpb 1.10 -> 1.05, more capacity wins at 15min"`
+   - If `val_bpb` is equal or worse: revert cleanly with `git reset --hard HEAD~1`
+   - Record the result in `results.tsv` either way.
 
 6. **Handle crashes:**
-   One fix attempt max. If it fails again, revert.
+   If a run produces no output or an obvious Python error, attempt one fix and re-run.
+   If it fails again, revert and move on. Do not spend more than two attempts on a crash.
 
-7. **Push after every kept experiment:**
+7. **Push progress to remote after every kept experiment:**
    ```
-   git push -u origin autoresearch/structural-shifts-amd
+   git push -u origin autoresearch/arch-exploration-amd-15min
    ```
 
-8. **Reflect briefly.** What did this tell you structurally? Inform the next hypothesis.
-
----
-
-## Experimental Discipline
-
-- **Composability first.** Wins from different categories may stack. Build on top.
-- **Expect crashes.** Structural changes touch hot paths; dtype / shape / autograd bugs
-  are common. Two-attempt rule still applies.
-- **Track VRAM.** New architectures may blow the 32GB budget. If a promising experiment
-  OOMs, reduce `DEVICE_BATCH_SIZE` and raise grad accum steps to keep `TOTAL_BATCH_SIZE` fixed.
-- **One change per experiment.** Always.
-- **Cross-seed noise floor ≈ 0.005.** Do not chase improvements smaller than this without
-  multi-seed verification.
-- **Plateau rule.** If 15 consecutive experiments produce no kept change across multiple
-  categories, stop and write a final summary — the structural axis may also be saturated.
+8. **Reflect briefly before the next experiment.**
+   In one sentence, note what the result implies about the model. Use this to inform your
+   next hypothesis. Prefer hypotheses that build on prior results rather than random jumps.
 
 ---
 
 ## Constraints
 
 - **Only modify `train.py`.** Never touch `prepare.py`, `pyproject.toml`, or any other file.
-- **Do not change the training time budget.** 10 minutes is fixed.
-- **Do not change the evaluation logic.** val_bpb must remain comparable.
-- **Do not revisit HP tuning on the existing optimizer.** LRs, betas, WD, softcap,
-  warmdown, init — these are tuned. You may re-tune `MATRIX_LR`/`EMBEDDING_LR` **only**
-  as part of an optimizer swap.
-- **Do not commit `results.tsv`, `run.log`, or `checkpoint*.pt`.** Gitignored.
+- **Do not change the training time budget.** The 15-minute wall-clock limit is fixed.
+- **Do not change the evaluation logic.** The val_bpb metric must remain comparable.
+- **Do not commit `results.tsv`.** It is a local log, not part of the git history.
+- **Prefer reversible experiments.** If a change is risky (e.g. restructuring the entire
+  training loop), start with a smaller version of the idea first.
+- **32GB VRAM limit.** Reduce `DEVICE_BATCH_SIZE` if OOM. Current default is 16.
 
 ---
 
 ## On Failure and Negative Results
 
-Negative results remain valuable. If an entire category (e.g. all optimizer swaps) fails,
-write a one-paragraph finding explaining *why* the category failed structurally — this
-prevents repetition in future sessions and is the real product of autoresearch at this
-stage.
+Negative results are valuable. If a hypothesis fails, record *why* it likely failed — this
+prevents wasted repetition and builds a coherent picture of the loss landscape. A session
+with 40 failed experiments and a clear understanding of why is more useful than 10 random
+successes with no explanation.
 
 ---
 
@@ -251,8 +194,7 @@ stage.
 
 Do not stop experimenting unless:
 - The data shards are missing and `prepare.py` has not been run (tell the human and wait)
-- There is an unrecoverable environment error (e.g. OOM that cannot be resolved by reducing
-  DEVICE_BATCH_SIZE)
-- You hit the plateau rule above (15 consecutive failures across multiple categories)
+- There is an unrecoverable environment error (e.g. GPU OOM that cannot be resolved by
+  reducing batch size)
 
-In all other cases, form a new hypothesis and continue.
+In all other cases, form a new hypothesis and continue. The human will check in the morning.
