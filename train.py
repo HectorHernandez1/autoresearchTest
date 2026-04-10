@@ -120,9 +120,17 @@ class MLP(nn.Module):
         self.w_gate = nn.Linear(config.n_embd, ffn_dim, bias=False)
         self.w_up = nn.Linear(config.n_embd, ffn_dim, bias=False)
         self.c_proj = nn.Linear(ffn_dim, config.n_embd, bias=False)
+        self._ffn_dim = ffn_dim
 
     def forward(self, x):
-        return norm(self.c_proj(F.silu(self.w_gate(x)) * self.w_up(x)))
+        # Fused gate+up projection via cat-in-forward (weights stay separate so
+        # Muon's per-shape LR scaling is unchanged; compile should fuse the cat
+        # into the matmul, turning 2 smaller GEMMs into one bigger one).
+        gu_weight = torch.cat([self.w_gate.weight, self.w_up.weight], dim=0)
+        gu = F.linear(x, gu_weight)
+        gate = gu[..., :self._ffn_dim]
+        up = gu[..., self._ffn_dim:]
+        return norm(self.c_proj(F.silu(gate) * up))
 
 
 class Block(nn.Module):
