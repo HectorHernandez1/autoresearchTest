@@ -343,18 +343,6 @@ def _maybe_compile(fn):
     return _lazy_compile_fallback(fn, dynamic=False, fullgraph=True)
 
 @_maybe_compile
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    dtype = exp_avg.dtype
-    exp_avg.lerp_(grad, (1 - beta1_t).to(dtype=dtype))
-    exp_avg_sq.lerp_(grad.square(), (1 - beta2_t).to(dtype=dtype))
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
-
-@_maybe_compile
 def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
                     momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
     # Nesterov momentum
@@ -399,38 +387,64 @@ class MuonAdamW(torch.optim.Optimizer):
 
     def __init__(self, param_groups):
         super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # 0-D CPU tensors to avoid torch.compile recompilation when values change (muon only)
         self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
+        # Batched AdamW: one pass over all params via torch._foreach_* ops.
+        # Same math as before, but instead of N Python-loop iterations each launching
+        # their own kernel, we launch one batched kernel per op across all params.
+        params = [p for p in group['params'] if p.grad is not None]
+        if not params:
+            return
+        grads = [p.grad for p in params]
+
+        # Group-level step counter (all params in a group share the same step).
+        if 'step' not in group:
+            group['step'] = 0
+        group['step'] += 1
+        step = group['step']
+
+        # Lazy-init state tensors for each param.
+        exp_avgs = []
+        exp_avg_sqs = []
+        for p in params:
             state = self.state[p]
-            if not state:
-                state['step'] = 0
+            if 'exp_avg' not in state:
                 state['exp_avg'] = torch.zeros_like(p)
                 state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group['lr'])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
+            exp_avgs.append(state['exp_avg'])
+            exp_avg_sqs.append(state['exp_avg_sq'])
+
+        beta1, beta2 = group['betas']
+        lr = group['lr']
+        eps = group['eps']
+        wd = group['weight_decay']
+
+        # Decoupled weight decay: p *= (1 - lr*wd)
+        if wd != 0.0:
+            torch._foreach_mul_(params, 1.0 - lr * wd)
+
+        # exp_avg = beta1 * exp_avg + (1 - beta1) * grad  ==  exp_avg.lerp_(grad, 1-beta1)
+        torch._foreach_lerp_(exp_avgs, grads, 1.0 - beta1)
+
+        # exp_avg_sq = beta2 * exp_avg_sq + (1 - beta2) * grad^2
+        torch._foreach_mul_(exp_avg_sqs, beta2)
+        torch._foreach_addcmul_(exp_avg_sqs, grads, grads, value=1.0 - beta2)
+
+        # denom = sqrt(exp_avg_sq) / sqrt(bias2) + eps
+        bias1 = 1.0 - beta1 ** step
+        bias2_corr = 1.0 - beta2 ** step
+        denom = torch._foreach_sqrt(exp_avg_sqs)
+        torch._foreach_div_(denom, math.sqrt(bias2_corr))
+        torch._foreach_add_(denom, eps)
+
+        # p -= (lr/bias1) * exp_avg / denom
+        step_size = lr / bias1
+        torch._foreach_addcdiv_(params, exp_avgs, denom, value=-step_size)
 
     def _step_muon(self, group):
         params = group['params']
