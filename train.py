@@ -591,6 +591,12 @@ x, y, epoch = next(train_loader)  # prefetch first batch (also used for compile 
 # torch.compile with try/except fallback. PyTorch 2.9+ on ROCm should have
 # Triton-based inductor support on RDNA4. Validate by running one forward+backward
 # on the compiled model before the training loop — if it explodes, fall back to eager.
+# Enable inductor's coordinate-descent tuning for additional kernel autotuning
+# on top of max-autotune — searches a 1D slice of the config space around the
+# initial autotune winner.
+import torch._inductor.config as _inductor_config
+_inductor_config.coordinate_descent_tuning = True
+
 def _try_compile_mode(mode_name, compile_kwargs):
     """Try compiling `model` with these kwargs; run a validation forward+backward.
     Returns the compiled model on success, or None on failure (caller falls through).
