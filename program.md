@@ -10,36 +10,39 @@ human input once the session has started.
 The metric you are optimizing is **val_bpb** (validation bits per byte). Lower is better.
 This metric is vocabulary-size-independent, so architectural changes are fairly compared.
 
-**This is a fresh architecture exploration session at 15 minutes per experiment.** All
-hyperparameters are open for re-tuning. Prior sessions were optimized for a 5-min budget —
-those results do NOT carry over. The optimal depth, width, batch size, and LRs will be
-different at 15 min.
+**This is a ROCm infrastructure recovery session at 15 minutes per experiment.** Prior
+sessions converged on hyperparameter tuning and hit a val_bpb plateau around 1.0905 on the
+R9700. Further HP tuning will only produce 0.00x gains. This session targets the AMD-specific
+performance gaps that are leaving roughly half of the GPU's compute on the floor — the next
+meaningful drops in val_bpb come from making the GPU actually work at its peak, not from
+more hyperparameter sweeps.
 
 ---
 
 ## Prior Work (context, do not blindly reuse)
 
-Prior sessions at 5-min budget found:
-- DEPTH=5, SwiGLU MLP, FFN_MULT=3, softcap=13, TOTAL_BATCH_SIZE=2^15 was optimal at 5 min
-- Muon is essential — AdamW and Lion were significantly worse
-- Value embeddings matter (~16% of val_bpb improvement)
-- QK-norm is stabilizing
-- **Throughput is king** — any change costing even 10% per-step speed gets punished
+Two prior phases on this codebase:
 
-**IMPORTANT:** These were tuned for 5 min. At 15 min you have 3x the steps, so:
-- Deeper models (DEPTH=7-10) may now converge where they couldn't before
-- Larger batch sizes may work (better gradient quality matters more with enough steps)
-- LR schedules need re-tuning for the longer horizon
-- Capacity vs throughput tradeoff shifts toward capacity
+**Phase 1 — 5-min budget** (~45 experiments): hit val_bpb ~1.17 plateau. Found: DEPTH=5,
+SwiGLU, FFN_MULT=3, softcap=13, TOTAL_BATCH_SIZE=2^15. Muon is essential. Value embeddings
+matter (~16% improvement). QK-norm stabilizing. Throughput is king.
 
-Start from the defaults in `train.py` and explore systematically. Do not assume the
-5-min optimum is the 15-min optimum.
+**Phase 2 — 15-min budget** (5 experiments): hit val_bpb 1.0905 plateau. Found: DEPTH=7 (more
+capacity at 3x budget), MATRIX_LR=0.015, WARMDOWN_RATIO=0.93, x0_lambdas=0.1. **Most phase-1
+settings (softcap, FFN_MULT, WEIGHT_DECAY, init stds) were inherited without re-verification
+at 15 min** — some may still be stale.
+
+**Both phases were pure hyperparam tuning.** Neither touched the ROCm-specific code paths
+responsible for the current MFU gap. That gap is the focus of this session.
+
+Do not re-run phase-1 or phase-2 experiments — read the commit history for context. Your
+starting point is the current HEAD of `autoresearch/rocm-infra-wins`.
 
 ---
 
 ## Setup (do this once at the start)
 
-1. **You are already on the experiment branch:** `autoresearch/structural-shifts-amd`.
+1. **You are already on the experiment branch:** `autoresearch/rocm-infra-wins`.
    Do not create a new branch. Do not switch branches.
 
 2. **Read all in-scope files for full context:**
@@ -58,10 +61,15 @@ Start from the defaults in `train.py` and explore systematically. Do not assume 
    ```
    Do not commit `results.tsv` — leave it untracked by git.
 
-5. **Record baseline:**
-   Run `uv run train.py > run.log 2>&1` on the current `train.py` to establish a baseline
-   val_bpb. Record it in `results.tsv`. This is your reference point for all future experiments.
-   The baseline will reflect the inherited 5-min config running for 15 min — expect ~1.05-1.10.
+5. **Record baseline (REQUIRED for this session):**
+   Run `uv run train.py > run.log 2>&1` on the current unmodified `train.py` to establish
+   a clean baseline for this branch. Record `val_bpb`, `peak_vram_mb`, `mfu_percent`, and
+   `num_steps` in `results.tsv`. This is your reference point for all future experiments.
+   **Do NOT trust the inherited 1.0905 from the prior branch as your baseline** — run a fresh
+   one. Every subsequent experiment compares against *this* number, not against 1.0905.
+   Pay close attention to `mfu_percent` — if it is below 30%, the infrastructure experiments
+   in the Research Direction below will have a large effect. If it is already above 35%, the
+   expected wins are smaller and you should prioritize re-verifying suspect hyperparams instead.
 
 6. **Confirm and proceed:**
    Once baseline is recorded, begin the experiment loop immediately. Do not wait.
@@ -70,44 +78,82 @@ Start from the defaults in `train.py` and explore systematically. Do not assume 
 
 ## Research Direction
 
-Your focus is **full architecture and hyperparameter exploration at the 15-min budget.**
-Everything is open. The goal is to find the best possible val_bpb for this GPU
-(AMD Radeon AI PRO R9700, 32GB VRAM, ~10% MFU) in 15 minutes of training.
+Your focus for this session is **ROCm infrastructure recovery** — fixing the AMD-specific
+performance gaps in `train.py` that are preventing the R9700 from running anywhere near
+its peak compute. Hyperparameter tuning is explicitly *not* the priority this session.
 
-### Priority areas to explore (in rough order):
+### Why this direction (the compute-bound argument)
 
-1. **Model depth vs. width tradeoffs**
-   The current `DEPTH` is 5 (optimized for 5 min). With 3x the budget, deeper models have
-   more time to converge. Try DEPTH 6, 7, 8, 10. Note that many dimensions (hidden size,
-   heads, FFN width) are derived from DEPTH, so changing it has broad downstream effects.
-   Understand these dependencies before experimenting.
+- The R9700 has **191.4 TFLOPS peak BF16** (about 19% of an H100's 989 TFLOPS).
+- The H100 reference baseline hits **38.5% MFU** in 5 minutes for val_bpb 0.997264.
+- The current R9700 code is likely hitting **15–25% MFU** in steady state because:
+  - `torch.compile` is hard-disabled on ROCm — look for `if not IS_ROCM` gates on both
+    `_maybe_compile` and the `torch.compile(model, ...)` call at the bottom of the model
+    setup section
+  - `_step_adamw` in `MuonAdamW` runs a per-parameter Python loop with 0-D CPU tensor fills
+    per param per step — every iteration is a host-side kernel launch
+  - The `SSSL` window pattern silently degrades to full causal on the ROCm SDPA path —
+    `F.scaled_dot_product_attention` ignores `window_size`, so every "S" layer is doing
+    full-attention work while the hyperparam search has been assuming it runs banded
+  - `DEVICE_BATCH_SIZE=16` was set when DEPTH=8 and FFN_MULT=4; current code is DEPTH=7 and
+    FFN_MULT=3, which uses meaningfully less VRAM and likely has headroom
+- **Fixing MFU is the single biggest lever available.** Going from ~20% → ~35% MFU ≈ 1.75x
+  throughput ≈ effectively bumping the budget from 15 → 26 minutes without changing it.
+  On prior budget scaling (5→15 min dropped val_bpb ~0.08), this is worth **roughly 0.03–0.06
+  off val_bpb**, which is 10–30x the marginal hyperparam gains the prior sessions were
+  chasing. That is the "clear change" we are hunting for.
 
-2. **Batch size and gradient accumulation**
-   Current `TOTAL_BATCH_SIZE` is 2^15 (optimized for max steps at 5 min). With 15 min, you
-   can afford larger batches (2^16, 2^17) for better gradient quality while still getting
-   enough steps. Sweep this early — it affects everything downstream.
+### Priority experiments (in order, each a single commit)
 
-3. **Learning rates**
-   All LRs (`MATRIX_LR`, `EMBEDDING_LR`, `UNEMBEDDING_LR`, `SCALAR_LR`) were tuned for
-   5-min DEPTH=5. Re-tune them for whatever depth/width you settle on. The LR scaling
-   `1/sqrt(model_dim/768)` should help, but the base rates may need adjustment.
+1. **Re-enable `torch.compile` on ROCm with a try/except fallback.**
+   Currently `_maybe_compile = torch.compile(...) if not IS_ROCM else lambda fn: fn` and the
+   model compile is gated the same way. PyTorch 2.9+ on ROCm 7 has Triton-based inductor
+   support that should work on RDNA4. Wrap the compile calls in `try: ... except Exception
+   as e: print(...); fallback_to_eager`. If the first compile blows up with a Triton error,
+   read the traceback carefully and try targeted fixes: `mode="reduce-overhead"`,
+   `fullgraph=False`, `dynamic=True`, or disabling specific fusions. This is the single
+   largest expected win — **allow up to 3 attempts before reverting** (overrides the default
+   two-attempt crash rule for this experiment specifically).
 
-4. **Warmdown and schedule**
-   `WARMDOWN_RATIO=0.85` was optimal at 5 min. At 15 min, the model has more time at peak
-   LR, so the optimal warmdown fraction may shift. Also re-examine `FINAL_LR_FRAC`.
+2. **Replace the per-parameter AdamW Python loop with `torch._foreach_*` ops.**
+   The current `_step_adamw` iterates over params in Python, fills 0-D CPU tensors per
+   param, and calls `adamw_step_fused` once per param. Swap to a single pass using
+   `torch._foreach_mul_`, `torch._foreach_lerp_`, `torch._foreach_addcmul_`, etc. Same math,
+   batched kernel dispatch. This win exists independent of torch.compile and stacks with it.
 
-5. **MLP and attention variants**
-   SwiGLU with FFN_MULT=3 was optimal at 5 min. At larger model sizes enabled by the longer
-   budget, FFN_MULT=4 or different activations may win. Also try different `WINDOW_PATTERN`
-   values — though note SDPA on ROCm ignores window_size, so this only affects the window
-   size metadata, not actual computation.
+3. **Use `torch.nn.attention.flex_attention` on the ROCm path to honor the SSSL window pattern.**
+   The ROCm branch in `CausalSelfAttention.forward` currently calls SDPA with `is_causal=True`
+   and ignores `window_size` entirely, meaning all layers run full causal even though "SSSL"
+   says 3 out of 4 should be banded. `flex_attention` supports arbitrary block masks and runs
+   on ROCm via Triton. Build a banded mask for "S" layers. Gate strictly behind `IS_ROCM` so
+   the FA3 path on NVIDIA is untouched. **Allow up to 3 attempts** — flex_attention has its
+   own set of compile quirks that may take a fix or two to land cleanly.
 
-6. **Weight decay, softcap, init**
-   These interact with model size and LR. Re-tune after settling on depth/width/LR.
+4. **Re-tune `DEVICE_BATCH_SIZE` upward for the current architecture.**
+   Check `peak_vram_mb` in your baseline `run.log`. If it's below 24,000 MB, try
+   `DEVICE_BATCH_SIZE=24` (and maybe 32). Larger per-device batches reduce Python/kernel
+   launch overhead per token. If OOM, revert and try the next smaller power.
 
-7. **Optimizer balance**
-   Muon is confirmed essential. But the Muon HPs (momentum, ns_steps, beta2) and the
-   AdamW-vs-Muon split may have different optima at the new scale.
+5. **Re-verify two suspect 5-min-era hyperparams at 15 min.**
+   Pick the two most suspicious phase-1 settings and sweep each in a single experiment:
+   - `FFN_MULT 3 → 4` (more MLP capacity may be worthwhile at longer budget)
+   - `WEIGHT_DECAY 0.4 → 0.2` (less regularization may fit better with 3x more steps)
+   Expected moves are small (0.005–0.015). Do these *after* the infra wins in 1–4 are
+   locked in, not before — the infra changes will shift the optimal values anyway.
+
+### What is explicitly OUT of scope this session
+
+- Architecture swings (GQA, MoE, Mixture of Depths, MLA, MoR). These belong in the next
+  session, *after* MFU is fixed. A compute-starved model does not benefit proportionally
+  from added capacity.
+- Hyperparameter micro-tuning of LRs, betas, softcap, warmdown, x0_lambdas, resid_lambdas,
+  init stds, SCALAR_LR, momentum schedules. These are what produced the 0.00x plateau on
+  the prior branch. **Do not restart that search.**
+- `prepare.py` changes of any kind, including `TIME_BUDGET`, `MAX_SEQ_LEN`, `EVAL_TOKENS`.
+  The 15-min budget is fixed for this session so results are comparable to the 1.0905
+  reference from the prior branch.
+- `pyproject.toml` / dependency changes. Work with whatever PyTorch version is already
+  installed. If a feature (e.g. `flex_attention`) is missing, fall back and note it.
 
 ---
 
@@ -119,11 +165,15 @@ Repeat the following indefinitely. **Never stop on your own.**
 
 1. **Form a hypothesis.**
    Write one clear sentence describing what you expect to change and why you think it will
-   help. Log this in `results.tsv` before running. Examples:
-   - "Increasing DEPTH from 5 to 8 will lower val_bpb because the 15-min budget provides
-     enough steps for a larger model to converge."
-   - "Increasing TOTAL_BATCH_SIZE from 2^15 to 2^17 will improve gradient quality enough
-     to offset the reduced step count at 15 min."
+   help. Log this in `results.tsv` before running. Examples appropriate to this session:
+   - "Re-enabling torch.compile on ROCm with a try/except fallback will raise MFU from
+     ~20% toward ~35% by fusing the model forward/backward, letting the same 15-min budget
+     produce ~1.5x more training steps."
+   - "Replacing the Python-loop AdamW with torch._foreach_* will reduce host-side kernel
+     launch overhead per step, raising tok/sec without changing any math."
+   - "Wiring flex_attention on the ROCm branch with a banded mask will restore the SSSL
+     pattern that currently silently runs as full causal, cutting attention FLOPs by ~40%
+     on S layers."
 
 2. **Make exactly one logical change at a time.**
    Do not bundle multiple independent changes in a single experiment — it makes results
@@ -161,7 +211,7 @@ Repeat the following indefinitely. **Never stop on your own.**
 
 7. **Push progress to remote after every kept experiment:**
    ```
-   git push -u origin autoresearch/structural-shifts-amd
+   git push -u origin autoresearch/rocm-infra-wins
    ```
 
 8. **Reflect briefly before the next experiment.**
