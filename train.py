@@ -612,7 +612,8 @@ def _try_compile_mode(mode_name, compile_kwargs):
 # Try compile modes from most-aggressive to safest. Each mode gets a validation
 # forward+backward; first one that passes wins. Falls through to eager.
 _compiled = (
-    _try_compile_mode("max-autotune", {"mode": "max-autotune"})
+    _try_compile_mode("max-autotune+fullgraph", {"mode": "max-autotune", "fullgraph": True})
+    or _try_compile_mode("max-autotune", {"mode": "max-autotune"})
     or _try_compile_mode("reduce-overhead", {"mode": "reduce-overhead"})
     or _try_compile_mode("default", {})
 )
