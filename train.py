@@ -591,33 +591,35 @@ x, y, epoch = next(train_loader)  # prefetch first batch (also used for compile 
 # torch.compile with try/except fallback. PyTorch 2.9+ on ROCm should have
 # Triton-based inductor support on RDNA4. Validate by running one forward+backward
 # on the compiled model before the training loop — if it explodes, fall back to eager.
-_compile_mode = "reduce-overhead"  # uses CUDA graphs under the hood
-try:
-    _compiled_model = torch.compile(model, dynamic=False, mode=_compile_mode)
-    with autocast_ctx:
-        _test_loss = _compiled_model(x, y)
-    _test_loss.backward()
-    model.zero_grad(set_to_none=True)
-    del _test_loss
-    model = _compiled_model
-    print(f"torch.compile: model compile succeeded (mode={_compile_mode}, test passed)")
-except Exception as e:
-    print(f"torch.compile: mode={_compile_mode} failed: {type(e).__name__}: {e}")
-    print("torch.compile: retrying with default mode")
-    model.zero_grad(set_to_none=True)
+def _try_compile_mode(mode_name, compile_kwargs):
+    """Try compiling `model` with these kwargs; run a validation forward+backward.
+    Returns the compiled model on success, or None on failure (caller falls through).
+    """
     try:
-        _compiled_model = torch.compile(model, dynamic=False)
+        compiled = torch.compile(model, dynamic=False, **compile_kwargs)
         with autocast_ctx:
-            _test_loss = _compiled_model(x, y)
-        _test_loss.backward()
+            test_loss = compiled(x, y)
+        test_loss.backward()
         model.zero_grad(set_to_none=True)
-        del _test_loss
-        model = _compiled_model
-        print("torch.compile: model compile succeeded (default mode, test passed)")
-    except Exception as e2:
-        print(f"torch.compile: default mode also failed: {type(e2).__name__}: {e2}")
-        print("torch.compile: falling back to eager model")
+        del test_loss
+        print(f"torch.compile: mode={mode_name} succeeded (test passed)")
+        return compiled
+    except Exception as e:
+        print(f"torch.compile: mode={mode_name} failed: {type(e).__name__}: {e}")
         model.zero_grad(set_to_none=True)
+        return None
+
+# Try compile modes from most-aggressive to safest. Each mode gets a validation
+# forward+backward; first one that passes wins. Falls through to eager.
+_compiled = (
+    _try_compile_mode("max-autotune", {"mode": "max-autotune"})
+    or _try_compile_mode("reduce-overhead", {"mode": "reduce-overhead"})
+    or _try_compile_mode("default", {})
+)
+if _compiled is not None:
+    model = _compiled
+else:
+    print("torch.compile: all modes failed, falling back to eager model")
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
