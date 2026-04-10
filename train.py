@@ -591,19 +591,33 @@ x, y, epoch = next(train_loader)  # prefetch first batch (also used for compile 
 # torch.compile with try/except fallback. PyTorch 2.9+ on ROCm should have
 # Triton-based inductor support on RDNA4. Validate by running one forward+backward
 # on the compiled model before the training loop — if it explodes, fall back to eager.
+_compile_mode = "reduce-overhead"  # uses CUDA graphs under the hood
 try:
-    _compiled_model = torch.compile(model, dynamic=False)
+    _compiled_model = torch.compile(model, dynamic=False, mode=_compile_mode)
     with autocast_ctx:
         _test_loss = _compiled_model(x, y)
     _test_loss.backward()
     model.zero_grad(set_to_none=True)
     del _test_loss
     model = _compiled_model
-    print("torch.compile: model compile succeeded (compile test passed)")
+    print(f"torch.compile: model compile succeeded (mode={_compile_mode}, test passed)")
 except Exception as e:
-    print(f"torch.compile: model compile failed: {type(e).__name__}: {e}")
-    print("torch.compile: falling back to eager model")
+    print(f"torch.compile: mode={_compile_mode} failed: {type(e).__name__}: {e}")
+    print("torch.compile: retrying with default mode")
     model.zero_grad(set_to_none=True)
+    try:
+        _compiled_model = torch.compile(model, dynamic=False)
+        with autocast_ctx:
+            _test_loss = _compiled_model(x, y)
+        _test_loss.backward()
+        model.zero_grad(set_to_none=True)
+        del _test_loss
+        model = _compiled_model
+        print("torch.compile: model compile succeeded (default mode, test passed)")
+    except Exception as e2:
+        print(f"torch.compile: default mode also failed: {type(e2).__name__}: {e2}")
+        print("torch.compile: falling back to eager model")
+        model.zero_grad(set_to_none=True)
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
