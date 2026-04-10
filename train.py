@@ -319,7 +319,28 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
-_maybe_compile = torch.compile(dynamic=False, fullgraph=True) if not IS_ROCM else lambda fn: fn
+def _lazy_compile_fallback(fn, **compile_kwargs):
+    """Compile `fn` with `compile_kwargs`; on first-call failure, fall back to eager.
+    torch.compile is lazy — errors surface at call time, not decoration time. This
+    wrapper catches that first error, logs once, and routes all subsequent calls
+    to the original eager function.
+    """
+    compiled = torch.compile(fn, **compile_kwargs)
+    state = {"use_eager": False}
+    def wrapper(*args, **kwargs):
+        if not state["use_eager"]:
+            try:
+                return compiled(*args, **kwargs)
+            except Exception as e:
+                print(f"[compile fallback] {fn.__name__} failed: {type(e).__name__}: {e}")
+                state["use_eager"] = True
+        return fn(*args, **kwargs)
+    wrapper.__name__ = getattr(fn, "__name__", "wrapper")
+    return wrapper
+
+
+def _maybe_compile(fn):
+    return _lazy_compile_fallback(fn, dynamic=False, fullgraph=True)
 
 @_maybe_compile
 def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
@@ -550,13 +571,25 @@ optimizer = model.setup_optimizer(
     weight_decay=WEIGHT_DECAY,
 )
 
-if not IS_ROCM:
-    model = torch.compile(model, dynamic=False)
-else:
-    print("ROCm detected: torch.compile disabled (enable with PyTorch 2.9+ on ROCm)")
-
 train_loader = make_dataloader(tokenizer, DEVICE_BATCH_SIZE, MAX_SEQ_LEN, "train")
-x, y, epoch = next(train_loader)  # prefetch first batch
+x, y, epoch = next(train_loader)  # prefetch first batch (also used for compile validation)
+
+# torch.compile with try/except fallback. PyTorch 2.9+ on ROCm should have
+# Triton-based inductor support on RDNA4. Validate by running one forward+backward
+# on the compiled model before the training loop — if it explodes, fall back to eager.
+try:
+    _compiled_model = torch.compile(model, dynamic=False)
+    with autocast_ctx:
+        _test_loss = _compiled_model(x, y)
+    _test_loss.backward()
+    model.zero_grad(set_to_none=True)
+    del _test_loss
+    model = _compiled_model
+    print("torch.compile: model compile succeeded (compile test passed)")
+except Exception as e:
+    print(f"torch.compile: model compile failed: {type(e).__name__}: {e}")
+    print("torch.compile: falling back to eager model")
+    model.zero_grad(set_to_none=True)
 
 print(f"Time budget: {TIME_BUDGET}s")
 print(f"Gradient accumulation steps: {grad_accum_steps}")
