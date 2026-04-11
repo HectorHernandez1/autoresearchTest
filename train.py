@@ -83,9 +83,15 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x, ve, cos_sin, window_size):
         B, T, C = x.size()
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
+        # Fused QKV via cat-in-forward (weights stay separate so Muon's
+        # per-shape LR scaling is unchanged; compile fuses the cat+matmul).
+        qkv_weight = torch.cat([self.c_q.weight, self.c_k.weight, self.c_v.weight], dim=0)
+        qkv = F.linear(x, qkv_weight)
+        q_end = self.n_head * self.head_dim
+        k_end = q_end + self.n_kv_head * self.head_dim
+        q = qkv[..., :q_end].view(B, T, self.n_head, self.head_dim)
+        k = qkv[..., q_end:k_end].view(B, T, self.n_kv_head, self.head_dim)
+        v = qkv[..., k_end:].view(B, T, self.n_kv_head, self.head_dim)
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
