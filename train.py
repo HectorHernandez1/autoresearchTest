@@ -605,6 +605,7 @@ x, y, epoch = next(train_loader)  # prefetch first batch (also used for compile 
 import torch._inductor.config as _inductor_config
 _inductor_config.coordinate_descent_tuning = True
 _inductor_config.aggressive_fusion = True
+_inductor_config.loop_ordering_after_fusion = True
 
 def _try_compile_mode(mode_name, compile_kwargs):
     """Try compiling `model` with these kwargs; run a validation forward+backward.
