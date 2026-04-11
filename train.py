@@ -612,6 +612,8 @@ import torch._inductor.config as _inductor_config
 _inductor_config.coordinate_descent_tuning = True
 _inductor_config.aggressive_fusion = True
 _inductor_config.loop_ordering_after_fusion = True
+_inductor_config.size_asserts = False
+_inductor_config.nan_asserts = False
 
 def _try_compile_mode(mode_name, compile_kwargs):
     """Try compiling `model` with these kwargs; run a validation forward+backward.
