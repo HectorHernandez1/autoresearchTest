@@ -27,9 +27,10 @@ TEMPERATURE = 0.9
 TOP_K = 40
 REPETITION_PENALTY = 1.3  # >1 discourages repeating recent tokens
 REPETITION_WINDOW = 64    # only penalize tokens seen in the last N positions
-DEPTH = 8
+DEPTH = 7
 ASPECT_RATIO = 64
 HEAD_DIM = 128
+FFN_MULT = 3
 
 # ---- Model definition (mirrors train.py) ----
 
@@ -95,7 +96,7 @@ class CausalSelfAttention(nn.Module):
         v = v.transpose(1, 2)
         y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1, 2).contiguous().view(B, T, -1)
-        y = self.c_proj(y)
+        y = norm(self.c_proj(y))  # NormFormer: norm after output proj
         return y
 
 
@@ -108,7 +109,7 @@ class MLP(nn.Module):
         self.c_proj = nn.Linear(ffn_dim, config.n_embd, bias=False)
 
     def forward(self, x):
-        return self.c_proj(F.silu(self.w_gate(x)) * self.w_up(x))
+        return norm(self.c_proj(F.silu(self.w_gate(x)) * self.w_up(x)))  # NormFormer
 
 
 class Block(nn.Module):
@@ -186,7 +187,7 @@ def build_config(depth, tokenizer):
     return GPTConfig(
         sequence_len=MAX_SEQ_LEN, vocab_size=tokenizer.get_vocab_size(),
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern="SSSL",
+        window_pattern="SSSL", ffn_mult=FFN_MULT,
     )
 
 
@@ -242,7 +243,9 @@ def main():
         with torch.device("meta"):
             model = GPT(ckpt_config)
         model.to_empty(device=device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        # Strip "_orig_mod." prefix added by torch.compile when the model was saved
+        state_dict = {k.replace("_orig_mod.", ""): v for k, v in ckpt["model_state_dict"].items()}
+        model.load_state_dict(state_dict)
         label = "trained"
     else:
         print("No checkpoint found — using random (untrained) weights")
