@@ -19,9 +19,14 @@ import torch.nn.functional as F
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+# varunneal's FA3 is Hopper only; kernels-community/flash-attn3 lacks Blackwell (sm_120) kernels
+# so fall back to PyTorch SDPA on Blackwell (cap >= 12) until FA3 gains sm_120 support
+_USE_FA3 = cap[0] < 12
+if _USE_FA3:
+    repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+    fa3 = get_kernel(repo).flash_attn_interface
+else:
+    fa3 = None
 
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, make_dataloader, evaluate_bpb
 
@@ -90,7 +95,16 @@ class CausalSelfAttention(nn.Module):
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         q, k = norm(q), norm(k)
 
-        y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        if fa3 is not None:
+            y = fa3.flash_attn_func(q, k, v, causal=True, window_size=window_size)
+        else:
+            # SDPA fallback for Blackwell (sm_120) — force flash backend to avoid O(n²) math path
+            from torch.nn.attention import sdpa_kernel, SDPBackend
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2).expand(-1, self.n_head, -1, -1).contiguous()
+            v = v.transpose(1, 2).expand(-1, self.n_head, -1, -1).contiguous()
+            with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=True).transpose(1, 2)
         y = y.contiguous().view(B, T, -1)
         y = self.c_proj(y)
         return y
@@ -448,7 +462,7 @@ FINAL_LR_FRAC = 0.0     # final LR as fraction of initial
 
 # Model size
 DEPTH = 8               # number of transformer layers
-DEVICE_BATCH_SIZE = 128  # per-device batch size (reduce if OOM)
+DEVICE_BATCH_SIZE = 64   # per-device batch size (reduce if OOM)
 
 # ---------------------------------------------------------------------------
 # Setup: tokenizer, model, optimizer, dataloader
@@ -460,7 +474,14 @@ torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-H100_BF16_PEAK_FLOPS = 989.5e12
+_GPU_PEAK_FLOPS = {
+    "H100": 989.5e12,
+    "RTX 5090": 419.2e12,
+    "RTX 4090": 165.2e12,
+    "A100": 312e12,
+}
+_gpu_name = torch.cuda.get_device_name(0)
+H100_BF16_PEAK_FLOPS = next((v for k, v in _GPU_PEAK_FLOPS.items() if k in _gpu_name), 989.5e12)
 
 tokenizer = Tokenizer.from_directory()
 vocab_size = tokenizer.get_vocab_size()
