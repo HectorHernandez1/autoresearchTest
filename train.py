@@ -17,6 +17,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+torch._inductor.config.aggressive_fusion = True
+
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
 # varunneal's FA3 is Hopper only; kernels-community/flash-attn3 lacks Blackwell (sm_120) kernels
