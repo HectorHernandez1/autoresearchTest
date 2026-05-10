@@ -16,7 +16,8 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
 
 1. **Create the experiment branch:**
    ```
-   git checkout -b autoresearch/arch-exploration
+   git checkout -b autoresearch/rtx5090-exploration
+   git push -u origin autoresearch/rtx5090-exploration
    ```
 
 2. **Read all in-scope files for full context:**
@@ -39,17 +40,22 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
    Run `uv run train.py > run.log 2>&1` on the unmodified `train.py` to establish a baseline
    val_bpb. Record it in `results.tsv`. This is your reference point for all future experiments.
 
-   Known H100 baseline for reference:
+   **RTX 5090 baseline (established, do not re-run unless train.py was modified):**
    ```
-   val_bpb:          0.997264
-   peak_vram_mb:     45060.2
-   mfu_percent:      38.50
-   total_tokens_M:   483.4
-   num_steps:        922
-   num_params_M:     50.3
+   val_bpb:          1.100640
+   peak_vram_mb:     22805.5
+   mfu_percent:      35.93
+   tok_per_sec:      ~646K
    depth:            8
+   device_batch:     64
    ```
-   Your baseline may differ slightly due to environment. The target is to beat **val_bpb 0.997264**.
+   The target is to beat **val_bpb 1.100640**.
+
+   **Platform notes for this machine (RTX 5090, Blackwell sm_120):**
+   - `kernels-community/flash-attn3` lacks sm_120 kernels — train.py auto-falls back to PyTorch SDPA
+   - `torch.compile` is enabled and working (~36% MFU)
+   - Keep `DEVICE_BATCH_SIZE = 64` (whisper.cpp server occupies ~4 GB VRAM on this machine)
+   - `TOTAL_BATCH_SIZE` must be divisible by `DEVICE_BATCH_SIZE * MAX_SEQ_LEN` = 64 * 2048 = 131072
 
 6. **Confirm and proceed:**
    Once baseline is recorded, begin the experiment loop immediately. Do not wait.
@@ -63,34 +69,51 @@ structure of the transformer model affects val_bpb within the fixed 5-minute com
 The goal is not just to find improvements, but to build a picture of *why* each change works
 or fails. Prefer interpretable changes over opaque ones.
 
-### Priority areas to explore (in rough order):
+### Suggested experiments (start here, in order):
 
-1. **Model depth vs. width tradeoffs**
-   The default `DEPTH` is 8. Try shallower (4, 6) and deeper (10, 12) models. Note that many
-   other dimensions (hidden size, heads, FFN width) are derived from `DEPTH`, so changing it
-   has broad downstream effects. Understand these dependencies before experimenting.
+These are concrete hypotheses to test. Each is one change. Run them in order — results from
+earlier ones should inform whether later ones are worth trying.
 
-2. **Attention window patterns**
-   The default `WINDOW_PATTERN` is `"SSSL"` (alternating banded + full attention). Try:
-   - `"L"` — all full attention (simpler, potentially more expressive but slower)
-   - `"SSL"` — fewer banded layers
-   - `"SSSSL"` — more banded layers before full
-   Understand the efficiency vs. expressiveness tradeoff each pattern implies.
+1. **Deeper model** — `DEPTH 8 → 12`
+   More layers = more capacity. At the same time budget, fewer steps but more expressive
+   per-step computation. Expect higher VRAM usage; check OOM before committing.
+   Hypothesis: deeper model learns better representations within the 5-min budget.
 
-3. **Normalization placement and type**
-   Experiment with pre-norm vs. post-norm, and whether QK-norm helps stabilize attention.
-   Pay attention to training stability — a run that crashes or diverges is still informative.
+2. **Larger total batch** — `TOTAL_BATCH_SIZE 524288 → 1048576`
+   More tokens per optimizer step = smoother gradient estimates. Must remain divisible by
+   131072 (DEVICE_BATCH_SIZE=64 × MAX_SEQ_LEN=2048). 1048576 / 131072 = 8 grad accum steps.
+   Hypothesis: larger batch reduces gradient noise and improves final val_bpb.
 
-4. **Optimizer balance (Muon vs. AdamW)**
-   The optimizer is a blend of Muon (for most weights) and AdamW (for embeddings/biases).
-   Try adjusting the learning rates and warmup independently for each component. Small
-   changes here can have outsized effects on convergence speed within the 5-minute budget.
+3. **Longer warmdown** — `WARMDOWN_RATIO 0.5 → 0.7`
+   Spending more of the budget cooling the LR down gives the model more time at low LR to
+   converge. Simple change, no memory impact.
+   Hypothesis: more warmdown time improves final val_bpb.
 
-5. **Feed-forward network (FFN) width**
-   The FFN hidden size is hardcoded as `4 * config.n_embd` in the `MLP` class. To experiment,
-   extract this into a configurable multiplier (e.g. `FFN_MULT = 4`) and try values above and
-   below the default. Wider FFNs add parameters but may not improve val_bpb proportionally
-   within the fixed time budget.
+4. **Wider FFN** — `FFN_MULT 3 → 4` (already a configurable param in the hyperparameter block)
+   Increases FFN capacity without changing depth or attention. Adds parameters, so slightly
+   fewer steps in the time budget.
+   Hypothesis: wider FFN improves val_bpb more than the lost steps cost.
+
+5. **Higher matrix LR** — `MATRIX_LR 0.04 → 0.06`
+   Muon learning rate for 2D matrix params. Small LR increase may speed up convergence
+   within the fixed budget. Easy to revert.
+   Hypothesis: higher Muon LR allows faster convergence without instability.
+
+6. **Attention window patterns** — `WINDOW_PATTERN "SSSL" → "L"`
+   All-full attention vs. the default mix of banded + full layers. More expressive but
+   uses more memory per step. Check if it fits at DEVICE_BATCH_SIZE=64.
+   Hypothesis: full attention in all layers improves val_bpb at the cost of throughput.
+
+7. **Shallower model** — `DEPTH 8 → 6`
+   Fewer layers = more steps within the time budget (faster per-step). May trade model
+   capacity for more gradient updates.
+   Hypothesis: more steps at smaller depth beats fewer steps at larger depth.
+
+### Priority areas to explore (after the above):
+
+- **Optimizer balance (Muon vs. AdamW):** Try adjusting `WARMUP_RATIO`, `EMBEDDING_LR`, `SCALAR_LR`.
+- **Normalization:** Experiment with QK-norm variations or residual scaling initialization.
+- **Combinations:** Once individual effects are understood, combine the best-performing changes.
 
 ---
 
@@ -141,7 +164,7 @@ Repeat the following indefinitely. **Never stop on your own.**
 
 7. **Push progress to remote after every kept experiment:**
    ```
-   git push -u origin autoresearch/arch-exploration
+   git push -u origin autoresearch/rtx5090-exploration
    ```
    This lets the human monitor results remotely. Only push after keeping a change, not after reverts.
 
