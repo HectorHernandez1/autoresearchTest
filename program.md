@@ -109,11 +109,42 @@ earlier ones should inform whether later ones are worth trying.
    capacity for more gradient updates.
    Hypothesis: more steps at smaller depth beats fewer steps at larger depth.
 
-### Priority areas to explore (after the above):
+### Phase 2: torch.compile Kernel Optimization (after optimizer plateau)
 
-- **Optimizer balance (Muon vs. AdamW):** Try adjusting `WARMUP_RATIO`, `EMBEDDING_LR`, `SCALAR_LR`.
-- **Normalization:** Experiment with QK-norm variations or residual scaling initialization.
-- **Combinations:** Once individual effects are understood, combine the best-performing changes.
+**Status:** Optimizer hyperparameter tuning has saturated (best val_bpb 1.089838, -0.98% from baseline).
+Pivot to kernel-level optimizations via torch.compile modes and Inductor flags.
+
+**Torch.compile experiments (in order):**
+
+1. **Reduce-overhead mode** — `torch.compile(..., mode="reduce-overhead")`
+   Minimizes Python-to-C++ overhead, trades some fusion for faster dispatch.
+   Hypothesis: overhead reduction yields measurable throughput gain and faster convergence.
+
+2. **Max-autotune mode** — `torch.compile(..., mode="max-autotune")`
+   Aggressive kernel fusion and memory layout optimization. Slower compilation but better kernel perf.
+   Hypothesis: better-fused kernels reduce memory traffic and improve val_bpb.
+
+3. **Inductor coordinate descent** — Add `torch._inductor.config.coordinate_descent_tuning = True`
+   Aggressive kernel autotuning during compilation.
+   Hypothesis: coordinate descent finds better tile/loop orderings for this GPU.
+
+4. **Aggressive fusion** — Add `torch._inductor.config.aggressive_fusion = True`
+   Fuses more operations into single kernels, trades compilation time for runtime.
+   Hypothesis: reduced memory roundtrips improve convergence within time budget.
+
+5. **Async compilation** — `torch.compile(..., mode="reduce-overhead", fullgraph=False)`
+   Allows dynamic shapes and async fallback to eager mode on unsupported ops.
+   Hypothesis: reduces stalls if any ops can't be compiled, maintains steady throughput.
+
+6. **Combine best flags** — Once individual effects are clear, combine top 2-3 winners.
+   Hypothesis: complementary optimizations stack to yield largest speedup.
+
+**How to modify train.py:**
+Locate the model compilation line (~line 475):
+```python
+model = torch.compile(model, ...)
+```
+Change only the mode string or add torch._inductor.config flags. One flag per experiment.
 
 ---
 
