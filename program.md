@@ -42,7 +42,7 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
 
    **RTX 5090 baseline (established, do not re-run unless train.py was modified):**
    ```
-   val_bpb:          1.100640
+   val_bpb:          1.100640 (5-minute budget)
    peak_vram_mb:     22805.5
    mfu_percent:      35.93
    tok_per_sec:      ~646K
@@ -50,6 +50,10 @@ This metric is vocabulary-size-independent, so architectural changes are fairly 
    device_batch:     64
    ```
    The target is to beat **val_bpb 1.100640**.
+   
+   **TIME_BUDGET UPDATED to 15 minutes (900s):** As of this session, all new experiments run with 3x the original
+   budget. This aligns with AMD GPU experiments and enables deeper exploration. Previous 5-minute results are
+   NOT directly comparable to new 15-minute runs.
 
    **Platform notes for this machine (RTX 5090, Blackwell sm_120):**
    - `kernels-community/flash-attn3` lacks sm_120 kernels — train.py auto-falls back to PyTorch SDPA
@@ -214,6 +218,48 @@ Architectural changes require deeper code edits than hyperparameter sweeps:
 Each experiment changes exactly one of the above. If a change requires multiple lines
 to implement correctly (e.g. QK Norm needs both q and k normalized), that still counts
 as ONE logical change. Run each in isolation and revert on regression.
+
+### Phase 4: Depth Reduction (HIGH PRIORITY — pursue aggressively)
+
+**Status:** Phase 3 architectural pivots (QK Norm, Z-loss, grad clip, cosine warmdown, attention
+temperature, softcap tuning) were all reverted — they made things worse or were neutral.
+Optimizer tuning beat architecture at the 5-minute budget. With 15-minute budget now active,
+pivot to depth reduction. AMD results showed depth 5 works well; current RTX 5090 uses depth 8.
+
+**Why depth reduction is critical:**
+- Current model (depth=8) uses fixed time budget → step-count limited
+- Shallower model = more steps within budget = better convergence
+- AMD achieved 39% improvement partly via depth 5 vs. depth 8
+- With 3x time budget (15 min), can explore deeper models, but should first test shallow
+
+**Depth experiments (in order):**
+
+1. **DEPTH 8 → 7** — one layer shallower
+   Expect +10% more steps (~660 steps vs 594 at 5min).
+   At 15-min budget, may reach ~2000 steps.
+   Hypothesis: extra 10-15% steps at smaller depth beats one layer's capacity loss.
+
+2. **DEPTH 7 → 6** — if exp 1 works, go shallower
+   Another ~10% step gain. Depth 6 is half the original.
+   Hypothesis: 6 layers + 20% more steps beats 8 layers at baseline steps.
+
+3. **DEPTH 6 → 5** — match AMD's winning depth
+   Further step increase, but now model capacity is significantly reduced.
+   Hypothesis: at full 15-min budget, depth 5 with massive step count converges better.
+
+**Re-tuning after depth change:**
+After each depth reduction, the optimal hyperparameters shift:
+- Momentum warmup steps may need to shorten (model trains faster with more steps)
+- SCALAR_LR may change (different layer structure)
+- x0_lambdas initialization may shift
+- Run 3 seeds per experiment and re-tune the top 2-3 hyperparams at new depth
+
+**How to modify train.py:**
+Locate the hyperparameter block (~line 450-470) and find:
+```python
+DEPTH = 8
+```
+Change to 7, 6, 5 per experiment. This auto-scales model_dim and all downstream sizing.
 
 ---
 
