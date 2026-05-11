@@ -146,6 +146,75 @@ model = torch.compile(model, ...)
 ```
 Change only the mode string or add torch._inductor.config flags. One flag per experiment.
 
+### Phase 3: Architectural and Regularization Pivots (after kernel optimization plateau)
+
+**Status:** Hyperparameter tuning and kernel optimization have plateaued at val_bpb ~1.0734
+(-2.46% from baseline). Pivot to architectural and regularization changes that may unlock
+further gains. These require more careful code edits than the previous phases — test each
+in isolation, revert cleanly on regression. Run **3 seeds per experiment** and compare
+averages, since gains in this regime (~0.001-0.005) are near the noise floor.
+
+**Pivot experiments (in order, highest expected value first):**
+
+1. **QK Normalization** — Add RMSNorm to queries and keys before attention computation
+   Stabilizes attention at higher learning rates, prevents logit drift, often unlocks
+   0.5-2% gains in modern transformer recipes. Apply after Q/K projection, before
+   the attention dot-product.
+   Hypothesis: normalized Q/K enable cleaner attention gradients and allow more
+   aggressive optimization without instability.
+
+2. **Z-loss regularization** — Add a small penalty on logit magnitude
+   `loss += 1e-4 * (logsumexp(logits, dim=-1) ** 2).mean()`
+   Penalizes logit drift, improves training stability without hurting capacity.
+   Hypothesis: regularizing logit magnitude complements logit softcapping and allows
+   sharper but better-calibrated output distributions.
+
+3. **Untie embeddings + lm_head** — Currently weight-tied; untie them
+   Adds parameters (~10M for vocab=50257, dim=512) but allows input/output to learn
+   separate representations. Will cost some steps within the time budget.
+   Hypothesis: decoupled embeddings improve final loss despite the step-count cost.
+
+4. **Gradient clipping** — Add `torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)`
+   after backward(), before optimizer.step(). Currently no clipping is applied.
+   Hypothesis: at the tightened optimum, clipping prevents occasional outlier gradient
+   steps that hurt convergence.
+
+5. **Cosine warmdown schedule** — Replace linear LR warmdown with cosine decay
+   Holds higher LR longer, then drops sharply at the end. Modify the lr_multiplier
+   function to use `0.5 * (1 + cos(pi * progress_in_warmdown))` shape during warmdown.
+   Hypothesis: more time at high LR improves convergence; sharp drop locks in details.
+
+6. **Attention temperature** — Change attention scale from `1/sqrt(d)` to learnable
+   per-layer scalar (init to `1/sqrt(d)`). Allows each layer to choose its sharpness.
+   Hypothesis: learnable temperature lets early/late layers diverge in attention
+   sharpness based on their role.
+
+7. **RoPE base frequency sweep** — Currently uses default RoPE base (10000)
+   Sweep base ∈ {1000, 10000, 50000, 500000}. Different frequencies change positional
+   encoding granularity at the 2048 context length.
+   Hypothesis: higher base frequency improves long-range attention precision at our
+   sequence length.
+
+8. **Logit softcap value** — Currently softcap=15; try 10, 20, 30
+   Changes how aggressively output logits are clamped before loss computation.
+   Hypothesis: tighter softcap regularizes more; looser allows sharper distributions
+   — sweep to find the optimum at the new tighter baseline.
+
+**How to modify train.py:**
+Architectural changes require deeper code edits than hyperparameter sweeps:
+- QK Norm: modify the attention forward pass to apply RMSNorm to q/k tensors
+- Z-loss: add to the loss computation block (search for `F.cross_entropy`)
+- Untie embeddings: find where `lm_head.weight = wte.weight` or similar tying occurs
+- Grad clipping: insert `torch.nn.utils.clip_grad_norm_` before `optimizer.step()`
+- Cosine warmdown: modify the `lr_multiplier()` function's warmdown branch
+- Attention temperature: replace `scale=1.0/math.sqrt(head_dim)` with learnable param
+- RoPE base: search for `theta=10000` or similar; update once at construction
+- Softcap: search for `softcap` or `15.0`; change the constant
+
+Each experiment changes exactly one of the above. If a change requires multiple lines
+to implement correctly (e.g. QK Norm needs both q and k normalized), that still counts
+as ONE logical change. Run each in isolation and revert on regression.
+
 ---
 
 ## Experiment Loop
